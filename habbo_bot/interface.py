@@ -94,10 +94,19 @@ class App:
         # --- boutons de controle ---------------------------------------------
         ctrl = tk.Frame(root, bg="#12141c")
         ctrl.pack(fill="x", padx=8)
-        self._btn(ctrl, "▶ Calibrer & Demarrer", self.start, "#50fa7b")
-        self._btn(ctrl, "⏸ Pause / Reprendre", self.toggle_pause, "#f1fa8c")
-        self._btn(ctrl, "■ Stop", self.stop, "#ff5555")
-        self._btn(ctrl, "⟳ Recalibrer plateau", self.recalib, "#8be9fd")
+        self._btn(ctrl, "▶ Demarrer (P)", self.start, "#50fa7b")
+        self._btn(ctrl, "⏸ Pause (Espace)", self.toggle_pause, "#f1fa8c")
+        self._btn(ctrl, "■ Stop (S)", self.stop, "#ff5555")
+        self._btn(ctrl, "⟳ Recalibrer (R)", self.recalib, "#8be9fd")
+
+        tk.Label(
+            root,
+            text=("Raccourcis clavier (marchent aussi quand le JEU a le focus) :  "
+                  "P = Calibrer & Demarrer   Espace = Pause/Reprendre   "
+                  "S = Stop   R = Recalibrer   Q = Quitter"),
+            font=("Consolas", 8), fg="#6272a4", bg="#12141c",
+            justify="left", wraplength=540,
+        ).pack(fill="x", padx=12, pady=(3, 0))
 
         # --- presets ----------------------------------------------------------
         pf = tk.LabelFrame(root, text="Presets", fg="#bd93f9", bg="#12141c",
@@ -145,7 +154,41 @@ class App:
 
         self.refresh()
 
-    # ------------------------------------------------------------------ utils
+        # Raccourcis clavier GLOBAUX (fonctionnent meme si le jeu a le focus).
+        self._start_hotkeys()
+
+    # --------------------------------------------------------------- hotkeys
+    def _start_hotkeys(self):
+        try:
+            self.listener = bot.keyboard.Listener(on_press=self.on_key)
+            self.listener.daemon = True
+            self.listener.start()
+        except Exception as e:
+            print(f"[UI] Raccourcis clavier indisponibles : {e}")
+
+    def on_key(self, key):
+        try:
+            k = key.char
+        except AttributeError:
+            k = None
+        if key == bot.keyboard.Key.space:
+            self.toggle_pause()
+        elif k == 'p':
+            self.start()
+        elif k == 's':
+            self.stop()
+        elif k == 'r':
+            self.recalib()
+        elif k == 'q':
+            self.root.after(0, self._quit)
+
+    def _quit(self):
+        bot.S.running = False
+        bot.S.quit = True
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
     def _btn(self, parent, text, cmd, color):
         tk.Button(parent, text=text, command=cmd, bg=color, fg="#12141c",
                   relief="flat", font=("Consolas", 10, "bold"), padx=6, pady=6
