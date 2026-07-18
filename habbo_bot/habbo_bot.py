@@ -19,6 +19,8 @@ et peut entrainer un bannissement. A utiliser a tes risques.
 import time
 import math
 import heapq
+import json
+import os
 
 import numpy as np
 import cv2
@@ -33,19 +35,19 @@ GRID = 7                     # plateau 7x7
 CLICK_DELAY = 0.03           # spam de clics : delai mini entre 2 clics
 LOOP_DELAY = 0.006           # pause entre deux analyses d'image (reactivite max)
 CLICK_LATENCY = 0.10         # ping du jeu (~100 ms) : compense la prediction des boules
-MOVE_SPEED = 3.0             # vitesse estimee du perso (cases/seconde) pour le suivi
+MOVE_SPEED = 2.9             # vitesse du perso (cases/s) MESUREE sur la video
 HORIZON = 14                 # nb de pas anticipes (planification espace-temps)
 PATCH = 6                    # demi-taille du carre echantillonne au centre d'une case
 SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
 SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 
-# Reaction : si une boule fonce vers une case a <= REACT_DIST cases, on change
-# de direction. Si la boule s'eloigne (trajectoire opposee), c'est "passable"
-# -> on avance quand meme (gere automatiquement car la projection est directionnelle).
-REACT_DIST = 2               # distance de reaction (en cases)
-PREDICT_STEPS = 3            # nb de cases anticipees devant chaque boule (cout doux)
-BALL_FASTER = 1.4            # les boules ~40% plus rapides que le joueur
+# Apprentissage "anti-mort" (leger, sans entrainement, memoire persistante)
+MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "habbo_bot_memory.json")
+CAUTION_STEP = 0.12          # prudence gagnee a chaque mort (0..1)
+CAUTION_MARGIN_TH = 0.45     # au-dela, marge de securite portee a 2 cases
+NO_YELLOW_DEATH = 25         # frames sans dalle -> partie terminee (mort/timeout)
 
 # Chrono du jeu : il faut toucher la dalle dans les 10 s.
 TIME_LIMIT = 10.0            # secondes imparties par dalle
@@ -91,10 +93,41 @@ class State:
         self.last_yellow = None
         self.deadline = None          # instant limite pour atteindre la dalle
         self.bbox = None              # zone de capture {top,left,width,height}
+        self.ice = set()              # glace (fixe) detectee au demarrage
+        # apprentissage anti-mort
+        self.deaths = 0               # nb de morts (persiste)
+        self.best_score = 0           # meilleur score de la session
+        self.caution = 0.0            # prudence globale (0..1), monte a chaque mort
+        self.death_mem = []           # signatures de situations mortelles
+        self.pre_sig = None           # signature de la derniere frame jouee
+        self.no_yellow = 0            # compteur de frames sans dalle
+        self.playing = False          # une partie est en cours
 
 
 S = State()
 mouse_ctl = mouse.Controller()
+
+
+def load_memory():
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            d = json.load(f)
+        S.deaths = d.get("deaths", 0)
+        S.caution = d.get("caution", 0.0)
+        S.death_mem = [frozenset(tuple(x) for x in sig) for sig in d.get("mem", [])]
+        print(f"[BOT] Memoire chargee : {S.deaths} morts, prudence={S.caution:.2f}, "
+              f"{len(S.death_mem)} situations mortelles connues.")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+def save_memory():
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump({"deaths": S.deaths, "caution": round(S.caution, 3),
+                       "mem": [[list(x) for x in sig] for sig in S.death_mem[-200:]]}, f)
+    except OSError:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -114,8 +147,12 @@ def detect_board():
     puis construit la transformation case <-> ecran. Le joueur spawn au centre."""
     img, off_x, off_y = grab_fullscreen()
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, TAN_LOW, TAN_HIGH)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    # sol beige + glace = losange COMPLET (la glace couvre des tuiles du haut,
+    # donc le beige seul laisserait un losange tronque -> coin haut fausse).
+    tan = cv2.inRange(hsv, TAN_LOW, TAN_HIGH)
+    ice = cv2.inRange(hsv, ICE_LOW, ICE_HIGH)
+    mask = cv2.bitwise_or(tan, ice)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8))
 
     n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     if n <= 1:
@@ -150,8 +187,11 @@ def detect_board():
               "height": int(max(ys) - min(ys) + 2 * MARGIN)}
 
     S.player = (3, 3)                  # spawn toujours au centre
+    # glace FIXE : detectee une fois au demarrage puis mise en cache
+    frame = grab_frame()
+    S.ice = detect_ice(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV))
     print(f"[BOT] Plateau detecte. centre(3,3)={tuple(int(v) for v in cell_to_screen_abs(3,3))} "
-          f"| zone {S.bbox}")
+          f"| glace={sorted(S.ice)} | zone {S.bbox}")
     return True
 
 
@@ -195,11 +235,13 @@ def color_mask(hsv, low, high):
 
 
 def detect_ice(hsv):
-    """Retourne l'ensemble des cases occupees par de la glace."""
+    """Cases de glace. Par les regles, la glace n'existe QUE sur les cases
+    interieures (lignes/colonnes 1,2,4,5) : bords + ligne/colonne centrale
+    toujours libres -> on restreint la recherche = zero faux positif de bord."""
     mask = color_mask(hsv, ICE_LOW, ICE_HIGH)
     ice = set()
-    for r in range(GRID):
-        for c in range(GRID):
+    for r in (1, 2, 4, 5):
+        for c in (1, 2, 4, 5):
             x, y = cell_to_local(r, c)
             patch = mask[max(0, y - PATCH):y + PATCH, max(0, x - PATCH):x + PATCH]
             if patch.size and patch.mean() > 60:   # >~25% de pixels bleus
@@ -324,15 +366,67 @@ class BallTracker:
 tracker = BallTracker()
 
 
-def predict_occupancy(balls, ice, horizon, player_speed):
+def situation_signature(balls, player):
+    """Signature d'une situation : boules relatives au joueur (pos + direction)."""
+    return frozenset((b.cell[0] - player[0], b.cell[1] - player[1],
+                      b.dir[0], b.dir[1]) for b in balls)
+
+
+def matches_death(sig):
+    """La situation courante ressemble-t-elle a une mort deja vecue ?
+    (chaque boule proche <=1 case d'une boule mortelle memorisee, meme sens)."""
+    for mem in S.death_mem:
+        ok = len(sig) == len(mem) and len(sig) > 0
+        if not ok:
+            continue
+        used = [False] * len(mem)
+        ml = list(mem)
+        for (dr, dc, ddr, ddc) in sig:
+            found = False
+            for i, (mr, mc, mdr, mdc) in enumerate(ml):
+                if not used[i] and abs(dr - mr) <= 1 and abs(dc - mc) <= 1 \
+                        and (ddr, ddc) == (mdr, mdc):
+                    used[i] = True
+                    found = True
+                    break
+            if not found:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def register_death():
+    """Enregistre une mort : +prudence, memorise la situation, sauvegarde."""
+    S.deaths += 1
+    S.caution = min(1.0, S.caution + CAUTION_STEP)
+    if S.pre_sig:
+        S.death_mem.append(S.pre_sig)
+    save_memory()
+    print(f"[BOT] *** MORT #{S.deaths} (score {S.score}) *** prudence -> {S.caution:.2f} "
+          f"| meilleur score session = {S.best_score}")
+    # reset de la partie
+    S.playing = False
+    S.score = 0
+    S.last_yellow = None
+    S.deadline = None
+    S.player = (3, 3)
+    S.move_accum = 0.0
+    S.pre_sig = None
+    tracker.reset()
+
+
+def predict_occupancy(balls, ice, horizon, player_speed, margin=1):
     """Simule chaque boule (ligne droite + rebond sur bord/glace/coin) et renvoie
-    occ[t] = cases MORTELLES au pas t (boule + ses 8 voisines : etre a 1 case =
-    perdu). t compte les pas du JOUEUR ; les boules avancent 'ratio' cases/pas."""
+    occ[t] = cases MORTELLES au pas t (boule + un halo de rayon `margin` : etre a
+    1 case = perdu ; `margin` monte a 2 quand la prudence apprise est elevee).
+    t compte les pas du JOUEUR ; les boules avancent 'ratio' cases/pas."""
     occ = [set() for _ in range(horizon + 1)]
 
     def add_lethal(t, r, c):
-        for ar in (-1, 0, 1):
-            for ac in (-1, 0, 1):
+        for ar in range(-margin, margin + 1):
+            for ac in range(-margin, margin + 1):
                 nr, nc = r + ar, c + ac
                 if in_grid(nr, nc):
                     occ[t].add((nr, nc))
@@ -524,9 +618,11 @@ def draw_debug(img, ice, spheres, yellow, path, mode, remaining):
 
     # HUD
     color = {"SAFE": (0, 255, 0), "URGENT": (0, 165, 255), "PANIC": (0, 0, 255)}
-    cv2.putText(vis, f"{mode}  t={remaining:4.1f}s  score={S.score}",
+    cv2.putText(vis, f"{mode}  t={remaining:4.1f}s  score={S.score}  best={S.best_score}",
                 (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                 color.get(mode, (255, 255, 255)), 2)
+    cv2.putText(vis, f"morts={S.deaths}  prudence={S.caution:.2f}  situations={len(S.death_mem)}",
+                (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 255), 1)
 
     cv2.imshow("Habbo Bot - debug (q pour quitter)", vis)
     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -550,8 +646,7 @@ def bot_loop():
         img = grab_frame()
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        ice = detect_ice(hsv)
-        ice_set = set(ice)
+        ice_set = S.ice                           # glace fixe (cache au demarrage)
         ball_pts = detect_blob_pixels(hsv, GREEN_LOW, GREEN_HIGH)
         dets = [local_to_gridf(x, y) for (x, y) in ball_pts]
         balls = tracker.update(dets, dt)          # tracker : dir + vitesse
@@ -559,17 +654,24 @@ def bot_loop():
         yellow = detect_yellow(hsv)
 
         if yellow is None:
+            # pas de dalle : soit entre deux parties, soit MORT (plateau reset).
+            S.no_yellow += 1
+            if S.playing and S.no_yellow >= NO_YELLOW_DEATH:
+                register_death()
             time.sleep(LOOP_DELAY)
             continue
+        S.no_yellow = 0
+        S.playing = True
 
         # nouvelle dalle -> +1 score, chrono relance, RE-SYNC : le perso est
         # forcement sur l'ancienne dalle qu'il vient de toucher.
         if S.last_yellow is None or yellow != S.last_yellow:
             if S.last_yellow is not None:
                 S.score += 1
+                S.best_score = max(S.best_score, S.score)
                 S.player = S.last_yellow      # re-synchronisation fiable
                 S.move_accum = 0.0
-                print(f"[BOT] Dalle atteinte ! Score = {S.score}")
+                print(f"[BOT] Dalle atteinte ! Score = {S.score} (best {S.best_score})")
             S.deadline = time.time() + TIME_LIMIT
         S.last_yellow = yellow
 
@@ -583,9 +685,15 @@ def bot_loop():
         else:
             mode = "SAFE"
 
-        # PREDICTION espace-temps : ou sera chaque boule (+ ses voisines) a chaque
-        # pas -> chemin garanti sans collision, re-calcule a chaque image.
-        occ = predict_occupancy(balls, ice_set, HORIZON, MOVE_SPEED)
+        # APPRENTISSAGE : marge de securite = 1 case, portee a 2 si la prudence
+        # apprise est elevee OU si la situation ressemble a une mort deja vecue.
+        S.pre_sig = situation_signature(balls, S.player)
+        risk_now = S.caution + (0.3 if matches_death(S.pre_sig) else 0.0)
+        margin = 2 if risk_now >= CAUTION_MARGIN_TH else 1
+
+        # PREDICTION espace-temps : ou sera chaque boule (+ halo) a chaque pas
+        # -> chemin garanti sans collision, re-calcule a chaque image.
+        occ = predict_occupancy(balls, ice_set, HORIZON, MOVE_SPEED, margin=margin)
         soon = occ[1]                              # cases mortelles imminentes
 
         path = spacetime_astar(S.player, yellow, ice_set, occ,
@@ -657,6 +765,9 @@ def on_press(key):
             S.deadline = None
             S.move_accum = 0.0
             S.last_t = None
+            S.no_yellow = 0
+            S.playing = False
+            S.score = 0
             tracker.reset()
             print("[BOT] Demarrage ! (space=pause, q=quitter, p=re-detecter)")
         else:
@@ -668,6 +779,7 @@ def main():
     print("Pret. Ouvre le jeu, place la fenetre du plateau bien visible,")
     print("puis appuie sur 'p' : le bot detecte le plateau et joue tout seul.")
     print("(space = pause/reprise, q = quitter, p = re-detecter le plateau)")
+    load_memory()                       # apprentissage anti-mort persistant
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     bot_loop()
