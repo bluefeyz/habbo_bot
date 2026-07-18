@@ -36,18 +36,29 @@ CLICK_DELAY = 0.03           # spam de clics : delai mini entre 2 clics
 LOOP_DELAY = 0.006           # pause entre deux analyses d'image (reactivite max)
 CLICK_LATENCY = 0.10         # ping du jeu (~100 ms) : compense la prediction des boules
 MOVE_SPEED = 2.9             # vitesse du perso (cases/s) MESUREE sur la video
-HORIZON = 14                 # nb de pas anticipes (planification espace-temps)
+HORIZON = 16                 # nb de pas anticipes (planification espace-temps)
 PATCH = 6                    # demi-taille du carre echantillonne au centre d'une case
 SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
 SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 
+# Anticipation des boules (le point cle demande) :
+#   rayon MORTEL   = collision certaine -> case totalement interdite
+#   rayon ANTICIP. = 2 cases d'avance -> fortement evite (mais franchissable en
+#   dernier recours) => laisse le temps a l'habbo d'esquiver.
+MARGIN_HARD = 1              # rayon mortel (case boule + 1)
+MARGIN_SOFT = 2             # rayon d'anticipation (2 cases d'avance)
+SOFT_COST = 9.0             # cout d'une case dans la zone d'anticipation
+SANDWICH_COST = 14.0        # cout supplementaire d'une case prise en tenaille
+
 # Apprentissage "anti-mort" (leger, sans entrainement, memoire persistante)
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "habbo_bot_memory.json")
 CAUTION_STEP = 0.12          # prudence gagnee a chaque mort (0..1)
-CAUTION_MARGIN_TH = 0.45     # au-dela, marge de securite portee a 2 cases
+CAUTION_HARD_TH = 0.45       # au-dela (ou situation deja mortelle), rayon mortel = 2
 NO_YELLOW_DEATH = 25         # frames sans dalle -> partie terminee (mort/timeout)
+MOTION_TH = 22               # seuil de mouvement pour tracker l'avatar
+AVATAR_MIN_AREA = 250        # aire mini du blob avatar (mouvement)
 
 # Chrono du jeu : il faut toucher la dalle dans les 10 s.
 TIME_LIMIT = 10.0            # secondes imparties par dalle
@@ -104,6 +115,7 @@ class State:
         self.playing = False          # une partie est en cours
         self.reached = False          # contact deja compte pour la dalle courante
         self.yellow_gone = False      # la dalle a disparu (teleport/clignotement)
+        self.prev_gray = None         # image precedente (tracking avatar par mouvement)
 
 
 S = State()
@@ -299,6 +311,35 @@ def local_to_gridf(x, y):
     return (rr - 0.5, cc - 0.5)
 
 
+def track_avatar(img, ball_pts):
+    """Suit l'habbo par le MOUVEMENT (indep. de sa couleur : gris, orange...).
+    Difference entre 2 images -> objets mobiles = boules + avatar ; on retire
+    les boules, le plus gros blob restant = l'avatar ; ses pieds -> la case.
+    Renvoie None si l'avatar est immobile (on garde alors la position connue)."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    prev = S.prev_gray
+    S.prev_gray = gray
+    if prev is None or prev.shape != gray.shape:
+        return None
+    diff = cv2.absdiff(gray, prev)
+    _, m = cv2.threshold(diff, MOTION_TH, 255, cv2.THRESH_BINARY)
+    for (x, y) in ball_pts:                       # efface le mouvement des boules
+        cv2.circle(m, (int(x), int(y)), 26, 0, -1)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, ba = None, 0
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a < AVATAR_MIN_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        r, cc = screen_local_to_cell(x + w / 2.0, y + h - 3)   # pieds
+        if in_grid(r, cc) and a > ba:
+            ba, best = a, (r, cc)
+    return best
+
+
 # ----------------------------------------------------------------------------
 # TRACKER DE BOULES : ID persistant + direction/vitesse mesurees
 # ----------------------------------------------------------------------------
@@ -421,19 +462,23 @@ def register_death():
     tracker.reset()
 
 
-def predict_occupancy(balls, ice, horizon, player_speed, margin=1):
+def predict_occupancy(balls, ice, horizon, player_speed, hard_r=1, soft_r=2):
     """Simule chaque boule (ligne droite + rebond sur bord/glace/coin) et renvoie
-    occ[t] = cases MORTELLES au pas t (boule + un halo de rayon `margin` : etre a
-    1 case = perdu ; `margin` monte a 2 quand la prudence apprise est elevee).
-    t compte les pas du JOUEUR ; les boules avancent 'ratio' cases/pas."""
-    occ = [set() for _ in range(horizon + 1)]
+    deux couches par pas t :
+      hard[t] = cases MORTELLES (boule + rayon `hard_r`)  -> interdites
+      soft[t] = zone d'ANTICIPATION (boule + rayon `soft_r`) -> fortement evitee
+    'balls_at[t]' garde le centre des boules pour l'anti-sandwich.
+    t = pas du JOUEUR ; les boules avancent 'ratio' cases/pas."""
+    hard = [set() for _ in range(horizon + 1)]
+    soft = [set() for _ in range(horizon + 1)]
+    balls_at = [[] for _ in range(horizon + 1)]
 
-    def add_lethal(t, r, c):
-        for ar in range(-margin, margin + 1):
-            for ac in range(-margin, margin + 1):
+    def add_ring(layer, t, r, c, rad):
+        for ar in range(-rad, rad + 1):
+            for ac in range(-rad, rad + 1):
                 nr, nc = r + ar, c + ac
                 if in_grid(nr, nc):
-                    occ[t].add((nr, nc))
+                    layer[t].add((nr, nc))
 
     for b in balls:
         r, c = b.cell
@@ -441,7 +486,9 @@ def predict_occupancy(balls, ice, horizon, player_speed, margin=1):
         ratio = max(0.3, b.speed / max(0.1, player_speed)) if b.speed > 0 else 1.0
         acc = 0.0
         for t in range(horizon + 1):
-            add_lethal(t, r, c)
+            add_ring(soft, t, r, c, soft_r)
+            add_ring(hard, t, r, c, hard_r)
+            balls_at[t].append((r, c))
             acc += ratio
             hops = int(acc)
             acc -= hops
@@ -455,7 +502,22 @@ def predict_occupancy(balls, ice, horizon, player_speed, margin=1):
                     if not in_grid(nr, nc) or (nr, nc) in ice:
                         break
                 r, c = nr, nc
-    return occ
+    return hard, soft, balls_at
+
+
+def sandwich_cells(balls_at_t):
+    """Cases 'prises en tenaille' : une boule d'un cote ET une de l'autre
+    (meme ligne ou meme colonne, a <=3 cases) -> a fortement eviter."""
+    out = set()
+    for r in range(GRID):
+        for c in range(GRID):
+            left = any(br == r and 0 < c - bc <= 3 for (br, bc) in balls_at_t)
+            right = any(br == r and 0 < bc - c <= 3 for (br, bc) in balls_at_t)
+            up = any(bc == c and 0 < r - br <= 3 for (br, bc) in balls_at_t)
+            down = any(bc == c and 0 < br - r <= 3 for (br, bc) in balls_at_t)
+            if (left and right) or (up and down):
+                out.add((r, c))
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -538,10 +600,13 @@ def astar(start, goal, ice, danger, risk=1.0):
     return None
 
 
-def spacetime_astar(start, goal, ice, occ, allow_lethal=False):
-    """A* dans l'espace-temps (case, t). occ[t] = cases mortelles au pas t.
-    L'attente sur place est autorisee (move (0,0)). Renvoie la suite de cases."""
-    H = len(occ) - 1
+def spacetime_astar(start, goal, ice, hard, soft, sandwich, allow_lethal=False):
+    """A* dans l'espace-temps (case, t).
+      hard[t]  = cases mortelles au pas t -> interdites (sauf PANIC).
+      soft[t]  = zone d'anticipation (2 cases) -> penalisee (SOFT_COST).
+      sandwich = cases en tenaille -> penalisees (SANDWICH_COST).
+    L'attente sur place est autorisee. Renvoie la suite de cases."""
+    H = len(hard) - 1
     moves = DIRS8 + [(0, 0)]
     start_s = (start, 0)
     open_h = [(0.0, 0.0, start_s)]
@@ -566,10 +631,16 @@ def spacetime_astar(start, goal, ice, occ, allow_lethal=False):
             if dr != 0 and dc != 0:
                 if (cell[0] + dr, cell[1]) in ice or (cell[0], cell[1] + dc) in ice:
                     continue
-            if not allow_lethal and ncell in occ[nt] and ncell != goal:
+            if not allow_lethal and ncell in hard[nt] and ncell != goal:
                 continue
             step = 1.0 if (dr == 0 or dc == 0) else 1.41
-            ng = gc + step
+            pen = 0.0
+            if ncell != goal:
+                if ncell in soft[nt]:
+                    pen += SOFT_COST
+                if ncell in sandwich:
+                    pen += SANDWICH_COST
+            ng = gc + step + pen
             st = (ncell, nt)
             if st not in g or ng < g[st]:
                 g[st] = ng
@@ -657,6 +728,11 @@ def bot_loop():
         spheres = [b.cell for b in balls]
         yellow = detect_yellow(hsv)
 
+        # --- TRACKING DE L'AVATAR par le mouvement (independant de sa couleur).
+        cell = track_avatar(img, ball_pts)
+        if cell is not None:
+            S.player = cell                       # position REELLE de l'habbo
+
         if yellow is None:
             # pas de dalle : soit teleport (clignotement bref), soit MORT (reset).
             S.no_yellow += 1
@@ -696,18 +772,21 @@ def bot_loop():
         else:
             mode = "SAFE"
 
-        # APPRENTISSAGE : marge de securite = 1 case, portee a 2 si la prudence
-        # apprise est elevee OU si la situation ressemble a une mort deja vecue.
+        # APPRENTISSAGE : marge = 2 cases par defaut (anticipation demandee).
+        # Rayon MORTEL porte a 2 si la prudence apprise est haute OU si la
+        # situation ressemble a une mort deja vecue (accumulation des erreurs).
         S.pre_sig = situation_signature(balls, S.player)
-        risk_now = S.caution + (0.3 if matches_death(S.pre_sig) else 0.0)
-        margin = 2 if risk_now >= CAUTION_MARGIN_TH else 1
+        risky = matches_death(S.pre_sig)
+        hard_r = 2 if (S.caution >= CAUTION_HARD_TH or risky) else MARGIN_HARD
+        soft_r = max(MARGIN_SOFT, hard_r + 1)
 
-        # PREDICTION espace-temps : ou sera chaque boule (+ halo) a chaque pas
-        # -> chemin garanti sans collision, re-calcule a chaque image.
-        occ = predict_occupancy(balls, ice_set, HORIZON, MOVE_SPEED, margin=margin)
-        soon = occ[1]                              # cases mortelles imminentes
+        # PREDICTION espace-temps (2 couches) + anti-sandwich.
+        hard, soft, balls_at = predict_occupancy(balls, ice_set, HORIZON,
+                                                 MOVE_SPEED, hard_r=hard_r, soft_r=soft_r)
+        sandwich = sandwich_cells(balls_at[1]) | sandwich_cells(balls_at[2])
+        soon = hard[1]                             # cases mortelles imminentes
 
-        path = spacetime_astar(S.player, yellow, ice_set, occ,
+        path = spacetime_astar(S.player, yellow, ice_set, hard, soft, sandwich,
                                allow_lethal=(mode == "PANIC"))
         if not path:   # aucun chemin sur -> on force (dernier recours) via A* simple
             path = astar(S.player, yellow, ice_set, {}, risk=0.0)
@@ -781,6 +860,7 @@ def on_press(key):
             S.score = 0
             S.reached = False
             S.yellow_gone = False
+            S.prev_gray = None
             tracker.reset()
             print("[BOT] Demarrage ! (space=pause, q=quitter, p=re-detecter)")
         else:
