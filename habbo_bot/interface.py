@@ -79,12 +79,33 @@ class App:
         self.root = root
         root.title("Habbo Bot - Panneau de controle")
         root.configure(bg="#12141c")
-        root.geometry("560x900")
+        root.geometry("580x760")
+        root.minsize(420, 400)
 
         self.vars = {}
 
+        # --- zone SCROLLABLE : tout le contenu defile (barre + molette) --------
+        outer = tk.Frame(root, bg="#12141c")
+        outer.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(outer, bg="#12141c", highlightthickness=0)
+        vsb = tk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(self.canvas, bg="#12141c")
+        self._win = self.canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfig(self._win, width=e.width))
+        # molette de la souris (Windows/mac : <MouseWheel> ; Linux : Button-4/5)
+        self.canvas.bind_all("<MouseWheel>",
+                             lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
+        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
+        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+
         # --- barre d'etat live -----------------------------------------------
-        top = tk.Frame(root, bg="#1b1e2b")
+        top = tk.Frame(body, bg="#1b1e2b")
         top.pack(fill="x", padx=8, pady=8)
         self.status = tk.Label(top, text="Arrete", font=("Consolas", 12, "bold"),
                                fg="#8be9fd", bg="#1b1e2b")
@@ -94,7 +115,7 @@ class App:
         self.live.pack(anchor="w", padx=10, pady=(2, 8))
 
         # --- boutons de controle ---------------------------------------------
-        ctrl = tk.Frame(root, bg="#12141c")
+        ctrl = tk.Frame(body, bg="#12141c")
         ctrl.pack(fill="x", padx=8)
         self._btn(ctrl, "▶ Demarrer (P)", self.start, "#50fa7b")
         self._btn(ctrl, "⏸ Pause (Espace)", self.toggle_pause, "#f1fa8c")
@@ -102,7 +123,7 @@ class App:
         self._btn(ctrl, "⟳ Recalibrer (R)", self.recalib, "#8be9fd")
 
         tk.Label(
-            root,
+            body,
             text=("Raccourcis clavier (marchent aussi quand le JEU a le focus) :  "
                   "P = Demarrer   O = Observer   Espace = Pause   "
                   "S = Stop   R = Recalibrer   Q = Quitter"),
@@ -110,7 +131,7 @@ class App:
             justify="left", wraplength=540,
         ).pack(fill="x", padx=12, pady=(3, 0))
 
-        obsrow = tk.Frame(root, bg="#12141c")
+        obsrow = tk.Frame(body, bg="#12141c")
         obsrow.pack(fill="x", padx=8)
         tk.Button(obsrow, text="👁  Observer & apprendre de MOI (O)", command=self.observe,
                   bg="#bd93f9", fg="#12141c", relief="flat",
@@ -118,7 +139,7 @@ class App:
                   ).pack(fill="x", padx=3, pady=(4, 2))
 
         # --- panneau IA / apprentissage (sortie visible) ---------------------
-        af = tk.LabelFrame(root, text="IA - Apprentissage (apprend de ses morts)",
+        af = tk.LabelFrame(body, text="IA - Apprentissage (apprend de ses morts)",
                            fg="#50fa7b", bg="#12141c", font=("Consolas", 10, "bold"))
         af.pack(fill="x", padx=8, pady=6)
         self.ai = tk.Label(af, text="", font=("Consolas", 9), justify="left",
@@ -126,7 +147,7 @@ class App:
         self.ai.pack(fill="x", padx=10, pady=6)
 
         # --- presets ----------------------------------------------------------
-        pf = tk.LabelFrame(root, text="Presets", fg="#bd93f9", bg="#12141c",
+        pf = tk.LabelFrame(body, text="Presets", fg="#bd93f9", bg="#12141c",
                            font=("Consolas", 10, "bold"))
         pf.pack(fill="x", padx=8, pady=8)
         row = tk.Frame(pf, bg="#12141c")
@@ -139,7 +160,7 @@ class App:
             b.pack(side="left", expand=True, fill="x", padx=3)
 
         # --- toggles ----------------------------------------------------------
-        tf = tk.LabelFrame(root, text="Comportements", fg="#bd93f9", bg="#12141c",
+        tf = tk.LabelFrame(body, text="Comportements", fg="#bd93f9", bg="#12141c",
                            font=("Consolas", 10, "bold"))
         tf.pack(fill="x", padx=8, pady=4)
         for attr, label in TOGGLES:
@@ -153,7 +174,7 @@ class App:
             cb.pack(fill="x", padx=10, pady=1)
 
         # --- curseurs ---------------------------------------------------------
-        sf = tk.LabelFrame(root, text="Reglages fins (en direct)", fg="#bd93f9",
+        sf = tk.LabelFrame(body, text="Reglages fins (en direct)", fg="#bd93f9",
                            bg="#12141c", font=("Consolas", 10, "bold"))
         sf.pack(fill="both", expand=True, padx=8, pady=4)
         for attr, label, lo, hi, res in SLIDERS:
