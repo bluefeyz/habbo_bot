@@ -24,12 +24,23 @@ Il installe tout seul les dépendances la première fois, puis démarre le bot.
    Si ce n'est pas le cas, réappuie sur **`p`** pour re-détecter.
 
 ### Touches
-| Touche | Action                              |
-|--------|-------------------------------------|
-| `p`    | détecter le plateau / (re)démarrer  |
-| `space`| pause / reprise                     |
-| `q`    | quitter le bot                      |
-| souris dans un coin de l'écran | arrêt d'urgence (failsafe) |
+| Touche | Action                                                        |
+|--------|---------------------------------------------------------------|
+| `p`    | détecter le plateau + **capturer ton visage** (perso au centre) + démarrer |
+| `f`    | re-capturer ton visage (si besoin, perso au centre)           |
+| `space`| pause / reprise                                               |
+| `q`    | quitter le bot                                                |
+| souris dans un coin de l'écran | arrêt d'urgence (failsafe)                    |
+
+> **Gating de tour** : le bot ne joue **que quand c'est ton tour** (il reconnaît
+> ton visage sur le plateau). Quand ce n'est pas ton tour (ou après une mort,
+> quand un autre joueur prend la main), il **lâche la souris** (aucun clic) et en
+> profite pour apprendre de ses erreurs. Appuie sur `p` **au début de ton tour**,
+> quand ton perso vient d'apparaître **au centre**.
+>
+> ⚠️ **N'utilise PAS d'auto-clicker externe** en même temps : ça entre en conflit
+> avec les clics du bot. Pour cliquer plus/moins vite, change `CLICK_DELAY`.
+> Si le bot ne reconnaît pas bien ton tour, ajuste `FACE_TH` (baisse-le un peu).
 
 > Le perso spawn **toujours au centre** (case 3,3), la dalle jaune en bas et les
 > 2 boules sur les côtés : le bot en tient compte au démarrage.

@@ -48,8 +48,9 @@ SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 #   dernier recours) => laisse le temps a l'habbo d'esquiver.
 MARGIN_HARD = 1              # rayon mortel (case boule + 1)
 MARGIN_SOFT = 2             # rayon d'anticipation (2 cases d'avance)
-SOFT_COST = 9.0             # cout d'une case dans la zone d'anticipation
-SANDWICH_COST = 14.0        # cout supplementaire d'une case prise en tenaille
+SOFT_COST = 3.5             # cout d'une case dans la zone d'anticipation (doux)
+SANDWICH_COST = 12.0        # cout supplementaire d'une case prise en tenaille
+TURN_COST = 0.8             # penalite de changement de direction -> preferer tout droit
 
 # Apprentissage "anti-mort" (leger, sans entrainement, memoire persistante)
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -59,6 +60,11 @@ CAUTION_HARD_TH = 0.45       # au-dela (ou situation deja mortelle), rayon morte
 NO_YELLOW_DEATH = 25         # frames sans dalle -> partie terminee (mort/timeout)
 MOTION_TH = 22               # seuil de mouvement pour tracker l'avatar
 AVATAR_MIN_AREA = 250        # aire mini du blob avatar (mouvement)
+
+# Reconnaissance de TON tour via ton visage (capture en direct au spawn central).
+FACE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_face.png")
+FACE_TH = 0.55               # score mini de reconnaissance du visage (a ajuster)
+TURN_LOST_FRAMES = 12        # frames sans ton visage -> ce n'est plus ton tour
 
 # Chrono du jeu : il faut toucher la dalle dans les 10 s.
 TIME_LIMIT = 10.0            # secondes imparties par dalle
@@ -116,6 +122,12 @@ class State:
         self.reached = False          # contact deja compte pour la dalle courante
         self.yellow_gone = False      # la dalle a disparu (teleport/clignotement)
         self.prev_gray = None         # image precedente (tracking avatar par mouvement)
+        self.face_tmpl = None         # modele du visage (capture au spawn)
+        self.face_score = 0.0         # dernier score de reconnaissance
+        self.my_turn = False          # est-ce ton tour de jouer ?
+        self.turn_miss = 0            # frames consecutives sans ton visage
+        self.commit = None            # case-cible engagee (anti-oscillation)
+        self.commit_dir = (0, 0)      # direction engagee
 
 
 S = State()
@@ -338,6 +350,47 @@ def track_avatar(img, ball_pts):
         if in_grid(r, cc) and a > ba:
             ba, best = a, (r, cc)
     return best
+
+
+def capture_face(img):
+    """Capture le visage de l'avatar au spawn (case centrale) comme modele.
+    A appeler quand c'est ton tour et que ton perso est au centre."""
+    tile = np.linalg.norm(S.e1)
+    cx, cy = cell_to_local(3, 3)
+    w = max(16, int(tile * 0.75)); h = max(20, int(tile * 1.0))
+    x = int(cx - w / 2); y = int(cy - tile * 1.45)   # la tete est au-dessus des pieds
+    x = max(0, x); y = max(0, y)
+    tmpl = img[y:y + h, x:x + w]
+    if tmpl.size:
+        S.face_tmpl = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+        cv2.imwrite(FACE_FILE, tmpl)
+        print(f"[BOT] Visage capture ({w}x{h}) au centre -> reconnaissance de tour active.")
+        return True
+    return False
+
+
+def detect_my_turn(img):
+    """Cherche TON visage sur le plateau. Renvoie (c_est_ton_tour, case_avatar).
+    Si aucun modele n'est charge -> joue toujours (pas de gating)."""
+    if S.face_tmpl is None:
+        return True, None
+    bg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    th, tw = S.face_tmpl.shape
+    best = (-1.0, None)
+    for s in (0.85, 0.95, 1.05, 1.15):
+        w, h = int(tw * s), int(th * s)
+        if w < 12 or h < 12 or h >= bg.shape[0] or w >= bg.shape[1]:
+            continue
+        res = cv2.matchTemplate(bg, cv2.resize(S.face_tmpl, (w, h)), cv2.TM_CCOEFF_NORMED)
+        _, mx, _, loc = cv2.minMaxLoc(res)
+        if mx > best[0]:
+            best = (mx, (loc, (w, h)))
+    S.face_score = best[0]
+    if best[0] >= FACE_TH and best[1]:
+        (x, y), (w, h) = best[1]
+        r, c = screen_local_to_cell(x + w / 2.0, y + h + np.linalg.norm(S.e1) * 0.5)
+        return True, ((r, c) if in_grid(r, c) else None)
+    return False, None
 
 
 # ----------------------------------------------------------------------------
@@ -600,23 +653,25 @@ def astar(start, goal, ice, danger, risk=1.0):
     return None
 
 
-def spacetime_astar(start, goal, ice, hard, soft, sandwich, allow_lethal=False):
-    """A* dans l'espace-temps (case, t).
-      hard[t]  = cases mortelles au pas t -> interdites (sauf PANIC).
-      soft[t]  = zone d'anticipation (2 cases) -> penalisee (SOFT_COST).
+def spacetime_astar(start, goal, ice, hard, soft, sandwich, allow_lethal=False,
+                    start_dir=(0, 0)):
+    """A* espace-temps (case, t, direction).
+      hard[t]  = cases mortelles -> interdites (sauf PANIC).
+      soft[t]  = zone d'anticipation -> penalisee (SOFT_COST).
       sandwich = cases en tenaille -> penalisees (SANDWICH_COST).
-    L'attente sur place est autorisee. Renvoie la suite de cases."""
+    Une PENALITE DE VIRAGE (TURN_COST) favorise les trajets en ligne droite
+    (moins d'esquives inutiles). L'attente sur place est autorisee."""
     H = len(hard) - 1
     moves = DIRS8 + [(0, 0)]
-    start_s = (start, 0)
+    start_s = (start, 0, start_dir)
     open_h = [(0.0, 0.0, start_s)]
     came = {start_s: None}
     g = {start_s: 0.0}
     while open_h:
-        _, gc, (cell, t) = heapq.heappop(open_h)
+        _, gc, (cell, t, pd) = heapq.heappop(open_h)
         if cell == goal:
             path = []
-            s = (cell, t)
+            s = (cell, t, pd)
             while s is not None:
                 path.append(s[0])
                 s = came[s]
@@ -640,11 +695,13 @@ def spacetime_astar(start, goal, ice, hard, soft, sandwich, allow_lethal=False):
                     pen += SOFT_COST
                 if ncell in sandwich:
                     pen += SANDWICH_COST
+            if (dr, dc) != (0, 0) and pd != (0, 0) and (dr, dc) != pd:
+                pen += TURN_COST                  # changement de direction
             ng = gc + step + pen
-            st = (ncell, nt)
+            st = (ncell, nt, (dr, dc))
             if st not in g or ng < g[st]:
                 g[st] = ng
-                came[st] = (cell, t)
+                came[st] = (cell, t, pd)
                 h = math.hypot(goal[0] - nr, goal[1] - nc)
                 heapq.heappush(open_h, (ng + h, ng, st))
     return None
@@ -698,6 +755,11 @@ def draw_debug(img, ice, spheres, yellow, path, mode, remaining):
                 color.get(mode, (255, 255, 255)), 2)
     cv2.putText(vis, f"morts={S.deaths}  prudence={S.caution:.2f}  situations={len(S.death_mem)}",
                 (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 255), 1)
+    if S.face_tmpl is not None:
+        tt = "TON TOUR" if S.my_turn else "PAS TON TOUR (souris libre)"
+        col = (0, 255, 0) if S.my_turn else (0, 0, 255)
+        cv2.putText(vis, f"{tt}  visage={S.face_score:.2f}", (10, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1)
 
     cv2.imshow("Habbo Bot - debug (q pour quitter)", vis)
     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -721,6 +783,27 @@ def bot_loop():
         img = grab_frame()
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
+        # --- GATING DE TOUR : ne jouer que quand c'est TON tour (ton visage present).
+        turn, face_cell = detect_my_turn(img)
+        if turn:
+            S.turn_miss = 0
+        else:
+            S.turn_miss += 1
+        if S.face_tmpl is not None and S.turn_miss >= TURN_LOST_FRAMES:
+            if S.my_turn:                     # ton tour vient de se terminer
+                if S.playing:
+                    register_death()          # fin de run -> apprentissage
+                S.my_turn = False
+                S.commit = None
+                S.prev_gray = None
+                print(f"[BOT] Ce n'est plus ton tour (visage absent, score visage "
+                      f"{S.face_score:.2f}) -> souris liberee.")
+            time.sleep(0.15)                  # on lache la souris, calcul minimal
+            continue
+        S.my_turn = True
+        if face_cell is not None:
+            S.player = face_cell              # position fiable via ton visage
+
         ice_set = S.ice                           # glace fixe (cache au demarrage)
         ball_pts = detect_blob_pixels(hsv, GREEN_LOW, GREEN_HIGH)
         dets = [local_to_gridf(x, y) for (x, y) in ball_pts]
@@ -728,10 +811,13 @@ def bot_loop():
         spheres = [b.cell for b in balls]
         yellow = detect_yellow(hsv)
 
-        # --- TRACKING DE L'AVATAR par le mouvement (independant de sa couleur).
-        cell = track_avatar(img, ball_pts)
-        if cell is not None:
-            S.player = cell                       # position REELLE de l'habbo
+        # --- TRACKING DE L'AVATAR par le mouvement (complement si pas de visage).
+        if face_cell is None:
+            cell = track_avatar(img, ball_pts)
+            if cell is not None:
+                S.player = cell               # position REELLE de l'habbo
+        else:
+            S.prev_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         if yellow is None:
             # pas de dalle : soit teleport (clignotement bref), soit MORT (reset).
@@ -787,7 +873,7 @@ def bot_loop():
         soon = hard[1]                             # cases mortelles imminentes
 
         path = spacetime_astar(S.player, yellow, ice_set, hard, soft, sandwich,
-                               allow_lethal=(mode == "PANIC"))
+                               allow_lethal=(mode == "PANIC"), start_dir=S.commit_dir)
         if not path:   # aucun chemin sur -> on force (dernier recours) via A* simple
             path = astar(S.player, yellow, ice_set, {}, risk=0.0)
 
@@ -798,18 +884,22 @@ def bot_loop():
 
         if path and len(path) >= 2:
             if path[1] in soon and mode != "PANIC":
-                # une boule va bloquer/toucher -> on CHANGE de direction tout de
-                # suite (esquive laterale sure a >= 1 case de toute boule).
+                # une boule va bloquer/toucher -> CHANGE de direction tout de suite.
                 ev = safe_step(S.player, yellow, ice_set, soon)
-                if ev:
-                    target = step_cell = ev
-                else:
-                    # piege (aucune case sure) : bouger vers le but reste moins
-                    # pire que rester fige (mort certaine sinon).
-                    target = step_cell = path[1]
+                target = step_cell = ev if ev else path[1]
+                S.commit = None
+            elif (S.commit is not None and S.commit != S.player
+                  and S.commit in path and path[1] not in soon):
+                # ENGAGEMENT : on garde le cap deja pris (anti aller-retour inutile).
+                target = S.commit
+                step_cell = path[1]
             else:
                 target = commit_target(path, soon)   # clic loin en ligne droite
                 step_cell = path[1]
+                S.commit = target
+            if step_cell:
+                S.commit_dir = (int(np.sign(step_cell[0] - S.player[0])),
+                                int(np.sign(step_cell[1] - S.player[1])))
 
         if target:
             x, y = cell_to_screen_abs(*target)
@@ -845,7 +935,7 @@ def on_press(key):
         print(f"[BOT] {'PAUSE' if S.paused else 'REPRISE'}")
         return
 
-    # 'p' : (re)detecte le plateau et (re)demarre
+    # 'p' : (re)detecte le plateau, capture ton visage (spawn centre) et demarre
     if k == 'p':
         print("[BOT] Detection automatique du plateau...")
         if detect_board():
@@ -861,10 +951,20 @@ def on_press(key):
             S.reached = False
             S.yellow_gone = False
             S.prev_gray = None
+            S.commit = None
+            S.commit_dir = (0, 0)
+            S.turn_miss = 0
+            capture_face(grab_frame())     # ton perso doit etre au CENTRE
             tracker.reset()
-            print("[BOT] Demarrage ! (space=pause, q=quitter, p=re-detecter)")
+            print("[BOT] Demarrage ! (p=re-detecter/recapturer, f=recapturer visage, "
+                  "space=pause, q=quitter)")
         else:
             print("[BOT] Echec detection. Verifie que le plateau est bien visible puis reappuie 'p'.")
+        return
+
+    # 'f' : recapture ton visage (a faire quand ton perso est au centre)
+    if k == 'f' and S.calibrated:
+        capture_face(grab_frame())
         return
 
 
