@@ -30,9 +30,10 @@ from pynput import keyboard, mouse
 # CONFIGURATION (a ajuster si la detection est mauvaise)
 # ----------------------------------------------------------------------------
 GRID = 7                     # plateau 7x7
-CLICK_DELAY = 0.035          # spam de clics : delai mini entre 2 clics
-LOOP_DELAY = 0.008           # pause entre deux analyses d'image (reactivite max)
+CLICK_DELAY = 0.03           # spam de clics : delai mini entre 2 clics
+LOOP_DELAY = 0.006           # pause entre deux analyses d'image (reactivite max)
 CLICK_LATENCY = 0.10         # ping du jeu (~100 ms) : compense la prediction des boules
+MOVE_SPEED = 3.0             # vitesse estimee du perso (cases/seconde) pour le suivi
 PATCH = 6                    # demi-taille du carre echantillonne au centre d'une case
 SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
@@ -82,6 +83,8 @@ class State:
         self.e2 = None                # vecteur +1 ligne (vers coin gauche)
         self.invM = None              # inverse pour ecran -> case
         self.player = (3, 3)          # position estimee du joueur (spawn = centre)
+        self.move_accum = 0.0         # accumulateur temps -> avancee du modele
+        self.last_t = None            # horodatage de la frame precedente
         self.prev_spheres = []        # spheres detectees a la frame precedente
         self.score = 0
         self.last_yellow = None
@@ -295,6 +298,22 @@ DIRS8 = [(-1, 0), (1, 0), (0, -1), (0, 1),
          (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
 
+def commit_target(path, soon):
+    """Renvoie la case la plus LOINTAINE atteignable en LIGNE DROITE sure depuis
+    le depart (meme direction, aucune case imminente-dangereuse). Cliquer loin =
+    le perso s'y rend seul (le jeu suit le clic). Au minimum path[1]."""
+    if len(path) < 2:
+        return None
+    d0 = (np.sign(path[1][0] - path[0][0]), np.sign(path[1][1] - path[0][1]))
+    tgt = path[1]
+    for i in range(2, len(path)):
+        di = (np.sign(path[i][0] - path[i - 1][0]), np.sign(path[i][1] - path[i - 1][1]))
+        if di != d0 or path[i] in soon:
+            break
+        tgt = path[i]
+    return tgt
+
+
 def safe_step(start, goal, ice, soon):
     """Choisit une case voisine sure (hors glace et hors trajectoire imminente
     des boules) qui rapproche le plus du but. Sert a esquiver dans l'urgence."""
@@ -410,6 +429,10 @@ def bot_loop():
             time.sleep(0.1)
             continue
 
+        now = time.time()
+        dt = (now - S.last_t) if S.last_t else 0.0
+        S.last_t = now
+
         img = grab_frame()
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
@@ -423,10 +446,13 @@ def bot_loop():
             time.sleep(LOOP_DELAY)
             continue
 
-        # nouvelle dalle detectee -> +1 score et chrono relance a 10 s
+        # nouvelle dalle -> +1 score, chrono relance, RE-SYNC : le perso est
+        # forcement sur l'ancienne dalle qu'il vient de toucher.
         if S.last_yellow is None or yellow != S.last_yellow:
             if S.last_yellow is not None:
                 S.score += 1
+                S.player = S.last_yellow      # re-synchronisation fiable
+                S.move_accum = 0.0
                 print(f"[BOT] Dalle atteinte ! Score = {S.score}")
             S.deadline = time.time() + TIME_LIMIT
         S.last_yellow = yellow
@@ -455,23 +481,31 @@ def bot_loop():
 
         draw_debug(img, ice_set, spheres, yellow, path, mode, remaining)
 
+        target = None       # case a CLIQUER (peut etre loin)
+        step_cell = None    # case vers laquelle le modele avance ce tick
+
         if path and len(path) >= 2:
-            nxt = path[1]
-            # SECURITE : ne jamais entrer sur une case ou une boule sera dans
-            # l'instant (sauf PANIC ou il faut absolument atteindre la dalle).
-            if nxt in soon and mode != "PANIC":
-                # tente un pas d'esquive lateral sur une case sure, sinon attend
-                alt = safe_step(S.player, yellow, ice_set, soon)
-                if alt:
-                    nxt = alt
-                else:
-                    time.sleep(LOOP_DELAY)
-                    continue
-            x, y = cell_to_screen_abs(*nxt)
-            pyautogui.click(int(x), int(y))
-            S.player = nxt
-            print(f"[BOT] {mode} t={remaining:4.1f}s ->{nxt} but{yellow} "
-                  f"boules{spheres} score={S.score}")
+            if path[1] in soon and mode != "PANIC":
+                # une boule fonce vers notre prochaine case -> on CHANGE de
+                # direction immediatement (esquive laterale sure).
+                ev = safe_step(S.player, yellow, ice_set, soon)
+                if ev:
+                    target = step_cell = ev
+                # sinon : aucune case sure -> on attend une image (target=None)
+            else:
+                target = commit_target(path, soon)   # clic loin en ligne droite
+                step_cell = path[1]
+
+        if target:
+            x, y = cell_to_screen_abs(*target)
+            pyautogui.click(int(x), int(y))          # clic loin : le perso y va
+            # suivi du modele dans le temps (avance vers la case suivante)
+            S.move_accum += dt * MOVE_SPEED
+            if S.move_accum >= 1.0 and step_cell:
+                S.move_accum -= 1.0
+                S.player = step_cell
+            print(f"[BOT] {mode} t={remaining:4.1f}s clic->{target} pas->{step_cell} "
+                  f"but{yellow} boules{spheres} score={S.score}")
             time.sleep(CLICK_DELAY)
         else:
             time.sleep(LOOP_DELAY)
@@ -504,6 +538,8 @@ def on_press(key):
             S.running = True
             S.last_yellow = None
             S.deadline = None
+            S.move_accum = 0.0
+            S.last_t = None
             print("[BOT] Demarrage ! (space=pause, q=quitter, p=re-detecter)")
         else:
             print("[BOT] Echec detection. Verifie que le plateau est bien visible puis reappuie 'p'.")

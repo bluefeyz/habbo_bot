@@ -55,4 +55,7 @@ Autres réglages utiles :
    trajets d'esquive complexes, re-calculés à chaque image (re-route immédiat).
 5. **Chrono 10 s** synchronisé (relancé quand la dalle se téléporte) avec 3 modes
    auto `SAFE` → `URGENT` → `PANIC` pour toujours toucher la dalle à temps.
-6. **Clic** sur la case suivante du chemin, en boucle et de façon agressive.
+6. **Clic loin + spam** : il clique la case la plus lointaine atteignable en ligne
+   droite sûre (le perso s'y rend seul), re-clique en continu, et **change de
+   direction instantanément** dès qu'une boule menace à ≤ 2 cases. À chaque dalle
+   touchée, la position réelle du perso est **re-synchronisée** (aucune dérive).
