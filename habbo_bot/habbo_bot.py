@@ -35,6 +35,7 @@ LOOP_DELAY = 0.02            # pause entre deux analyses d'image (reactivite max
 PATCH = 6                    # demi-taille du carre echantillonne au centre d'une case
 SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
+SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 
 # Chrono du jeu : il faut toucher la dalle dans les 10 s.
 TIME_LIMIT = 10.0            # secondes imparties par dalle
@@ -274,6 +275,54 @@ def astar(start, goal, ice, danger, risk=1.0):
 
 
 # ----------------------------------------------------------------------------
+# OVERLAY DE DEBUG (fenetre OpenCV)
+# ----------------------------------------------------------------------------
+def draw_debug(img, ice, spheres, yellow, path, mode, remaining):
+    if not SHOW_DEBUG:
+        return
+    vis = img.copy()
+
+    # grille + cases de glace
+    for r in range(GRID):
+        for c in range(GRID):
+            x, y = cell_to_local(r, c)
+            col = (255, 200, 120) if (r, c) in ice else (70, 70, 70)
+            cv2.circle(vis, (x, y), 4, col, -1)
+            cv2.putText(vis, f"{r}{c}", (x - 10, y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (90, 90, 90), 1)
+
+    # dalle jaune
+    if yellow:
+        x, y = cell_to_local(*yellow)
+        cv2.rectangle(vis, (x - 14, y - 14), (x + 14, y + 14), (0, 255, 255), 2)
+
+    # spheres
+    for (r, c) in spheres:
+        x, y = cell_to_local(r, c)
+        cv2.circle(vis, (x, y), 12, (0, 0, 255), 2)
+
+    # chemin choisi
+    if path and len(path) >= 2:
+        pts = [cell_to_local(*cell) for cell in path]
+        for i in range(len(pts) - 1):
+            cv2.line(vis, pts[i], pts[i + 1], (0, 255, 0), 2)
+
+    # joueur
+    px, py = cell_to_local(*S.player)
+    cv2.drawMarker(vis, (px, py), (255, 0, 255), cv2.MARKER_CROSS, 22, 3)
+
+    # HUD
+    color = {"SAFE": (0, 255, 0), "URGENT": (0, 165, 255), "PANIC": (0, 0, 255)}
+    cv2.putText(vis, f"{mode}  t={remaining:4.1f}s  score={S.score}",
+                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                color.get(mode, (255, 255, 255)), 2)
+
+    cv2.imshow("Habbo Bot - debug (q pour quitter)", vis)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        S.quit = True
+
+
+# ----------------------------------------------------------------------------
 # BOUCLE PRINCIPALE
 # ----------------------------------------------------------------------------
 def bot_loop():
@@ -325,6 +374,8 @@ def bot_loop():
         path = astar(S.player, yellow, ice_set, danger, risk=risk)
         if not path:  # secours : ignore le danger, garde juste la glace
             path = astar(S.player, yellow, ice_set, {}, risk=0.0)
+
+        draw_debug(img, ice_set, spheres, yellow, path, mode, remaining)
 
         if path and len(path) >= 2:
             nxt = path[1]
@@ -407,6 +458,7 @@ def main():
     listener.start()
     bot_loop()
     listener.stop()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
