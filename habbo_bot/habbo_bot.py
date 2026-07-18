@@ -42,6 +42,11 @@ SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
 SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 
+# Comportements activables (modifiables en direct via l'interface) :
+DIAGONALS = True             # autoriser les deplacements en diagonale
+TEMPORIZE = True             # attendre pres de la dalle et toucher au dernier moment
+DODGE = True                 # esquiver activement (anticipation des boules)
+
 # Anticipation des boules (le point cle demande) :
 #   rayon MORTEL   = collision certaine -> case totalement interdite
 #   rayon ANTICIP. = 2 cases d'avance -> fortement evite (mais franchissable en
@@ -134,6 +139,12 @@ class State:
         self.turn_miss = 0            # frames consecutives sans ton visage
         self.commit = None            # case-cible engagee (anti-oscillation)
         self.commit_dir = (0, 0)      # direction engagee
+        # stats live (pour l'interface)
+        self.mode = ""
+        self.act = ""
+        self.nballs = 0
+        self.fps = 0.0
+        self.remaining = TIME_LIMIT
 
 
 S = State()
@@ -580,7 +591,7 @@ def best_hold_cell(player, goal, ice, hard, soft, sandwich):
     proche de la dalle, sans osciller pour rien. Permet d'attendre une ouverture
     au lieu de foncer. Renvoie la case a viser (peut etre la case actuelle)."""
     cands = [player]
-    for dr, dc in DIRS8:
+    for dr, dc in moves_dirs():
         nr, nc = player[0] + dr, player[1] + dc
         if not in_grid(nr, nc) or (nr, nc) in ice:
             continue
@@ -627,6 +638,12 @@ def sandwich_cells(balls_at_t):
 # ----------------------------------------------------------------------------
 DIRS8 = [(-1, 0), (1, 0), (0, -1), (0, 1),
          (-1, -1), (-1, 1), (1, -1), (1, 1)]
+DIRS4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+
+def moves_dirs():
+    """Directions autorisees (avec ou sans diagonales, selon le reglage)."""
+    return DIRS8 if DIAGONALS else DIRS4
 
 
 def commit_target(path, soon):
@@ -650,7 +667,7 @@ def safe_step(start, goal, ice, soon):
     des boules) qui rapproche le plus du but. Sert a esquiver dans l'urgence."""
     best = None
     best_h = 1e9
-    for dr, dc in DIRS8:
+    for dr, dc in moves_dirs():
         nr, nc = start[0] + dr, start[1] + dc
         if not in_grid(nr, nc) or (nr, nc) in ice or (nr, nc) in soon:
             continue
@@ -680,7 +697,7 @@ def astar(start, goal, ice, danger, risk=1.0):
                 path.append(cur)
                 cur = came[cur]
             return path[::-1]
-        for dr, dc in DIRS8:
+        for dr, dc in moves_dirs():
             nr, nc = cur[0] + dr, cur[1] + dc
             nxt = (nr, nc)
             if not in_grid(nr, nc):
@@ -711,7 +728,7 @@ def spacetime_astar(start, goal, ice, hard, soft, sandwich, allow_lethal=False,
     Une PENALITE DE VIRAGE (TURN_COST) favorise les trajets en ligne droite
     (moins d'esquives inutiles). L'attente sur place est autorisee."""
     H = len(hard) - 1
-    moves = DIRS8 + [(0, 0)]
+    moves = moves_dirs() + [(0, 0)]
     start_s = (start, 0, start_dir)
     open_h = [(0.0, 0.0, start_s)]
     came = {start_s: None}
@@ -828,6 +845,8 @@ def bot_loop():
         now = time.time()
         dt = (now - S.last_t) if S.last_t else 0.0
         S.last_t = now
+        if dt > 0:
+            S.fps = 0.8 * S.fps + 0.2 * (1.0 / dt)
 
         img = grab_frame()
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -906,6 +925,9 @@ def bot_loop():
             mode = "URGENT"
         else:
             mode = "SAFE"
+        S.mode = mode
+        S.remaining = remaining
+        S.nballs = len(balls)
 
         # APPRENTISSAGE : marge = 2 cases par defaut (anticipation demandee).
         # Rayon MORTEL porte a 2 si la prudence apprise est haute OU si la
@@ -919,6 +941,9 @@ def bot_loop():
         hard, soft, balls_at = predict_occupancy(balls, ice_set, HORIZON,
                                                  MOVE_SPEED, hard_r=hard_r, soft_r=soft_r)
         sandwich = sandwich_cells(balls_at[1]) | sandwich_cells(balls_at[2])
+        if not DODGE:                              # esquive desactivee : seul le
+            soft = [set() for _ in soft]           # danger mortel est evite
+            sandwich = set()
         soon = hard[1]                             # cases mortelles imminentes
 
         path = spacetime_astar(S.player, yellow, ice_set, hard, soft, sandwich,
@@ -939,6 +964,8 @@ def bot_loop():
         # FONCER vers la dalle seulement si : le temps presse, panique, ou rester
         # ici devient dangereux. Sinon on TEMPORISE (on attend une ouverture).
         must_go = (remaining <= travel + HOLD_BUFFER) or mode == "PANIC" or my_safe <= 2
+        if not TEMPORIZE:
+            must_go = True                         # temporisation desactivee -> foncer
 
         if must_go and path and len(path) >= 2:
             if path[1] in soon and mode != "PANIC":
@@ -976,10 +1003,12 @@ def bot_loop():
             if S.move_accum >= 1.0 and step_cell:
                 S.move_accum -= 1.0
                 S.player = step_cell
+            S.act = act
             print(f"[BOT] {act} t={remaining:4.1f}s clic->{target} but{yellow} "
                   f"boules{spheres} score={S.score}")
             time.sleep(CLICK_DELAY)
         else:
+            S.act = act
             time.sleep(LOOP_DELAY)
 
 
