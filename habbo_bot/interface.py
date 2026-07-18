@@ -108,6 +108,14 @@ class App:
             justify="left", wraplength=540,
         ).pack(fill="x", padx=12, pady=(3, 0))
 
+        # --- panneau IA / apprentissage (sortie visible) ---------------------
+        af = tk.LabelFrame(root, text="IA - Apprentissage (apprend de ses morts)",
+                           fg="#50fa7b", bg="#12141c", font=("Consolas", 10, "bold"))
+        af.pack(fill="x", padx=8, pady=6)
+        self.ai = tk.Label(af, text="", font=("Consolas", 9), justify="left",
+                           fg="#f8f8f2", bg="#12141c", anchor="w", wraplength=520)
+        self.ai.pack(fill="x", padx=10, pady=6)
+
         # --- presets ----------------------------------------------------------
         pf = tk.LabelFrame(root, text="Presets", fg="#bd93f9", bg="#12141c",
                            font=("Consolas", 10, "bold"))
@@ -255,6 +263,13 @@ class App:
             f"Mode : {s.mode:6s} Action : {s.act:5s}   Temps : {s.remaining:4.1f}s\n"
             f"Boules : {s.nballs}   Prudence : {s.caution:.2f}   FPS : {s.fps:4.0f}"
         ))
+        self.ai.config(text=(
+            f"Morts : {s.deaths}    Prudence : {s.caution:.2f}    "
+            f"Situations connues : {len(s.death_mem)}\n"
+            f"Zones dangereuses apprises : {s.danger_zones}    "
+            f"Survie moyenne : {s.avg_survival:.1f} pts\n"
+            f"Derniere lecon : {s.last_lesson or '(aucune mort encore)'}"
+        ))
         self.root.after(120, self.refresh)
 
 
@@ -272,6 +287,7 @@ def main():
         return
 
     try:
+        bot.load_memory()          # charge l'apprentissage persistant (morts, zones apprises)
         # demarre la boucle du bot en tache de fond (elle attend running=True)
         threading.Thread(target=bot.bot_loop, daemon=True).start()
         root = tk.Tk()

@@ -68,6 +68,8 @@ MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "habbo_bot_memory.json")
 CAUTION_STEP = 0.12          # prudence gagnee a chaque mort (0..1)
 CAUTION_HARD_TH = 0.45       # au-dela (ou situation deja mortelle), rayon mortel = 2
+LEARN_COST = 1.5             # cout de pathfinding ajoute par mort memorisee sur une case
+LEARN_MAX = 8.0              # plafond du cout "appris" pour une case
 NO_YELLOW_DEATH = 25         # frames sans dalle -> partie terminee (mort/timeout)
 MOTION_TH = 22               # seuil de mouvement pour tracker l'avatar
 AVATAR_MIN_AREA = 250        # aire mini du blob avatar (mouvement)
@@ -128,6 +130,12 @@ class State:
         self.caution = 0.0            # prudence globale (0..1), monte a chaque mort
         self.death_mem = []           # signatures de situations mortelles
         self.pre_sig = None           # signature de la derniere frame jouee
+        self.cell_deaths = {}         # heatmap apprise : (r,c) -> nb de morts
+        self.run_scores = []          # score de chaque run (pour la survie moyenne)
+        self.last_alive_cell = (3, 3) # derniere case sure connue (juste avant la mort)
+        self.last_lesson = ""         # resume lisible du dernier apprentissage (sortie IA)
+        self.avg_survival = 0.0       # score moyen avant de mourir
+        self.danger_zones = 0         # nb de cases apprises comme dangereuses
         self.no_yellow = 0            # compteur de frames sans dalle
         self.playing = False          # une partie est en cours
         self.reached = False          # contact deja compte pour la dalle courante
@@ -151,6 +159,14 @@ S = State()
 mouse_ctl = mouse.Controller()
 
 
+def _recompute_learning_stats():
+    """Met a jour les indicateurs affiches (zones dangereuses, survie moyenne)."""
+    S.danger_zones = sum(1 for n in S.cell_deaths.values() if n >= 1.0)
+    if S.run_scores:
+        recent = S.run_scores[-10:]
+        S.avg_survival = sum(recent) / len(recent)
+
+
 def load_memory():
     try:
         with open(MEMORY_FILE, "r") as f:
@@ -158,8 +174,12 @@ def load_memory():
         S.deaths = d.get("deaths", 0)
         S.caution = d.get("caution", 0.0)
         S.death_mem = [frozenset(tuple(x) for x in sig) for sig in d.get("mem", [])]
+        S.cell_deaths = {tuple(int(v) for v in k.split(",")): float(n)
+                         for k, n in d.get("cell_deaths", {}).items()}
+        S.run_scores = list(d.get("run_scores", []))
+        _recompute_learning_stats()
         print(f"[BOT] Memoire chargee : {S.deaths} morts, prudence={S.caution:.2f}, "
-              f"{len(S.death_mem)} situations mortelles connues.")
+              f"{len(S.death_mem)} situations, {S.danger_zones} zones dangereuses apprises.")
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
@@ -168,7 +188,10 @@ def save_memory():
     try:
         with open(MEMORY_FILE, "w") as f:
             json.dump({"deaths": S.deaths, "caution": round(S.caution, 3),
-                       "mem": [[list(x) for x in sig] for sig in S.death_mem[-200:]]}, f)
+                       "mem": [[list(x) for x in sig] for sig in S.death_mem[-200:]],
+                       "cell_deaths": {f"{r},{c}": round(n, 2)
+                                       for (r, c), n in S.cell_deaths.items()},
+                       "run_scores": S.run_scores[-50:]}, f)
     except OSError:
         pass
 
@@ -511,20 +534,50 @@ def matches_death(sig):
 
 
 def register_death():
-    """Enregistre une mort : +prudence, memorise la situation, sauvegarde."""
+    """Enregistre une mort et EN APPREND : signature mortelle, heatmap par-case,
+    prudence adaptative et statistiques de survie (sortie IA lisible)."""
     S.deaths += 1
-    S.caution = min(1.0, S.caution + CAUTION_STEP)
+    nballs = len(S.pre_sig) if S.pre_sig else 0
+    score = S.score
+
+    # 1) apprentissage "signature" : la config de boules qui a tue
     if S.pre_sig:
         S.death_mem.append(S.pre_sig)
+
+    # 2) apprentissage "heatmap" : la case de la mort (+voisins) devient chere,
+    #    donc EVITEE PROACTIVEMENT les prochaines fois (anticipation qui progresse).
+    dr, dc = S.last_alive_cell
+    S.cell_deaths[(dr, dc)] = S.cell_deaths.get((dr, dc), 0.0) + 1.0
+    for adr, adc in DIRS4:
+        nb = (dr + adr, dc + adc)
+        if in_grid(*nb):
+            S.cell_deaths[nb] = S.cell_deaths.get(nb, 0.0) + 0.4
+
+    # 3) prudence ADAPTATIVE : monte si on meurt vite, redescend si on survit bien
+    #    (evite de devenir paralyse a force de morts).
+    if score <= 1:
+        S.caution = min(1.0, S.caution + CAUTION_STEP)
+    elif score >= 5:
+        S.caution = max(0.0, S.caution - 0.5 * CAUTION_STEP)
+    else:
+        S.caution = min(1.0, S.caution + 0.5 * CAUTION_STEP)
+
+    # 4) statistiques de survie + resume lisible (affiche dans l'interface)
+    S.run_scores.append(score)
+    _recompute_learning_stats()
+    S.last_lesson = (f"Mort #{S.deaths} en case {S.last_alive_cell} "
+                     f"(score {score}, {nballs} boules) -> case evitee, "
+                     f"prudence {S.caution:.2f}")
     save_memory()
-    print(f"[BOT] *** MORT #{S.deaths} (score {S.score}) *** prudence -> {S.caution:.2f} "
-          f"| meilleur score session = {S.best_score}")
+    print(f"[BOT] *** MORT #{S.deaths} (score {score}) *** {S.last_lesson} "
+          f"| survie moy={S.avg_survival:.1f} | zones={S.danger_zones}")
     # reset de la partie
     S.playing = False
     S.score = 0
     S.last_yellow = None
     S.deadline = None
     S.player = (3, 3)
+    S.last_alive_cell = (3, 3)
     S.move_accum = 0.0
     S.pre_sig = None
     S.reached = False
@@ -761,6 +814,9 @@ def spacetime_astar(start, goal, ice, hard, soft, sandwich, allow_lethal=False,
                     pen += SOFT_COST
                 if ncell in sandwich:
                     pen += SANDWICH_COST
+                ld = S.cell_deaths.get(ncell, 0.0)
+                if ld:                              # apprentissage : case deja mortelle
+                    pen += min(LEARN_MAX, LEARN_COST * ld)
             if (dr, dc) != (0, 0) and pd != (0, 0) and (dr, dc) != pd:
                 pen += TURN_COST                  # changement de direction
             ng = gc + step + pen
@@ -933,6 +989,7 @@ def bot_loop():
         # Rayon MORTEL porte a 2 si la prudence apprise est haute OU si la
         # situation ressemble a une mort deja vecue (accumulation des erreurs).
         S.pre_sig = situation_signature(balls, S.player)
+        S.last_alive_cell = S.player          # memorise la case (pour apprendre la mort)
         risky = matches_death(S.pre_sig)
         hard_r = 2 if (S.caution >= CAUTION_HARD_TH or risky) else MARGIN_HARD
         soft_r = max(MARGIN_SOFT, hard_r + 1)

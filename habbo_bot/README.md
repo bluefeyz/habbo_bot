@@ -28,6 +28,27 @@ curseurs réglables **en direct**.
 3. Ajuste les curseurs / presets pendant qu'il joue pour trouver le meilleur réglage.
    Boutons **Pause / Reprendre**, **Stop** et **Recalibrer plateau** disponibles.
 
+### Raccourcis clavier (marchent aussi quand le JEU a le focus)
+| Touche  | Action                       |
+|---------|------------------------------|
+| `P`     | Calibrer le plateau + démarrer |
+| `Espace`| Pause / Reprendre            |
+| `S`     | Stop                         |
+| `R`     | Recalibrer le plateau        |
+| `Q`     | Quitter                      |
+
+### IA – apprentissage anti-mort (visible dans l'interface)
+Le panneau **« IA – Apprentissage »** montre en direct ce que le bot apprend :
+- **Morts** et **Prudence** (0→1) : la prudence est *adaptative* — elle monte quand
+  le bot meurt vite, redescend quand il enchaîne les points.
+- **Situations connues** : configurations de boules déjà mortelles reconnues.
+- **Zones dangereuses apprises** : cases où le bot est déjà mort → il les **évite
+  proactivement** (coût de pathfinding augmenté sur ces cases).
+- **Survie moyenne** et **dernière leçon** apprise.
+
+Tout est sauvegardé dans `habbo_bot_memory.json` et **persiste entre les sessions** :
+plus tu joues, mieux il anticipe.
+
 ## 4. Si la détection est mauvaise
 Ouvre `habbo_bot.py` et ajuste les **plages de couleurs HSV** en haut du fichier
 (`ICE_LOW/HIGH`, `GREEN_LOW/HIGH`, `YELLOW_LOW/HIGH`). Les logs affichés dans la
