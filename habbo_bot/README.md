@@ -10,40 +10,23 @@
   - ⚠️ Pendant l'installation, coche **« Add Python to PATH »**.
 - Pas besoin de Visual Studio. (VS Code est utile juste pour lire/éditer le code.)
 
-## 2. Lancer le bot
-Double-clique simplement sur **`lancer_bot.bat`**.
-Il installe tout seul les dépendances la première fois, puis démarre le bot.
+## 2. Lancer le bot (avec l'interface graphique)
+Double-clique sur **`lancer_bot.bat`** (ou `lancer_interface.bat`, c'est identique).
+Il installe tout seul les dépendances la première fois (patiente 1-3 min au 1er
+lancement), puis ouvre une **fenêtre grise « Habbo Bot - Panneau de controle »**
+avec des boutons, des presets (Prudent / Équilibré / Agressif / EXTREME) et des
+curseurs réglables **en direct**.
 
-## 3. Utilisation (aucun calibrage à faire 🎉)
-1. Ouvre le jeu Habbo et laisse le **plateau bien visible** à l'écran (le sol beige
-   entièrement dégagé, sans fenêtre par-dessus).
-2. Dans la fenêtre noire du bot, appuie sur **`p`**.
-   → Le bot **détecte automatiquement** le plateau (repère le sol beige, calcule
-   les 4 coins et la grille 7×7), place ton perso au **centre** (spawn) et démarre.
-3. Une fenêtre de debug s'ouvre : vérifie que la grille rouge est bien calée.
-   Si ce n'est pas le cas, réappuie sur **`p`** pour re-détecter.
+> Si aucune fenêtre grise n'apparaît et que ça reste dans la console noire :
+> lis le texte affiché (il t'indique l'erreur, souvent Tkinter manquant → il
+> faut réinstaller Python depuis python.org en laissant coché « tcl/tk and IDLE »).
 
-### Touches
-| Touche | Action                                                        |
-|--------|---------------------------------------------------------------|
-| `p`    | détecter le plateau + **capturer ton visage** (perso au centre) + démarrer |
-| `f`    | re-capturer ton visage (si besoin, perso au centre)           |
-| `space`| pause / reprise                                               |
-| `q`    | quitter le bot                                                |
-| souris dans un coin de l'écran | arrêt d'urgence (failsafe)                    |
-
-> **Gating de tour** : le bot ne joue **que quand c'est ton tour** (il reconnaît
-> ton visage sur le plateau). Quand ce n'est pas ton tour (ou après une mort,
-> quand un autre joueur prend la main), il **lâche la souris** (aucun clic) et en
-> profite pour apprendre de ses erreurs. Appuie sur `p` **au début de ton tour**,
-> quand ton perso vient d'apparaître **au centre**.
->
-> ⚠️ **N'utilise PAS d'auto-clicker externe** en même temps : ça entre en conflit
-> avec les clics du bot. Pour cliquer plus/moins vite, change `CLICK_DELAY`.
-> Si le bot ne reconnaît pas bien ton tour, ajuste `FACE_TH` (baisse-le un peu).
-
-> Le perso spawn **toujours au centre** (case 3,3), la dalle jaune en bas et les
-> 2 boules sur les côtés : le bot en tient compte au démarrage.
+### Utilisation depuis l'interface
+1. Ouvre le jeu Habbo, plateau bien visible (sol beige dégagé, sans fenêtre par-dessus).
+2. Dans l'interface, clique sur **« ▶ Calibrer & Demarrer »** : le bot détecte
+   automatiquement le plateau (grille 7×7) et commence à jouer.
+3. Ajuste les curseurs / presets pendant qu'il joue pour trouver le meilleur réglage.
+   Boutons **Pause / Reprendre**, **Stop** et **Recalibrer plateau** disponibles.
 
 ## 4. Si la détection est mauvaise
 Ouvre `habbo_bot.py` et ajuste les **plages de couleurs HSV** en haut du fichier
