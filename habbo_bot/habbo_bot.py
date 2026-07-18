@@ -8,7 +8,7 @@ Ce script tourne EN LOCAL sur ton PC. Il :
   4. clique automatiquement la case suivante pour atteindre la dalle jaune.
 
 Touches :
-  p     -> lancer le calibrage puis demarrer le bot
+  p     -> detecte automatiquement le plateau puis demarre le bot
   space -> pause / reprise
   q     -> quitter
 
@@ -30,31 +30,39 @@ from pynput import keyboard, mouse
 # CONFIGURATION (a ajuster si la detection est mauvaise)
 # ----------------------------------------------------------------------------
 GRID = 7                     # plateau 7x7
-CLICK_DELAY = 0.11           # pause apres chaque clic (laisse le perso avancer)
-LOOP_DELAY = 0.02            # pause entre deux analyses d'image (reactivite max)
+CLICK_DELAY = 0.13           # temps estime pour traverser 1 case (ajuste si besoin)
+LOOP_DELAY = 0.015           # pause entre deux analyses d'image (reactivite max)
+CLICK_LATENCY = 0.10         # ping du jeu (~100 ms) : compense la prediction des boules
 PATCH = 6                    # demi-taille du carre echantillonne au centre d'une case
 SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
 SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 
+# Les boules vont un peu plus vite que le joueur -> on projette leur position
+# plusieurs cases en avant (en tenant compte du ping) pour ne jamais les croiser.
+PREDICT_STEPS = 3            # nb de cases anticipees devant chaque boule
+BALL_FASTER = 1.4            # les boules ~40% plus rapides que le joueur
+
 # Chrono du jeu : il faut toucher la dalle dans les 10 s.
 TIME_LIMIT = 10.0            # secondes imparties par dalle
-URGENT_AFTER = 6.0           # au-dela, le bot prend des risques pour arriver a temps
-PANIC_AFTER = 8.0            # au-dela, chemin le plus court coute que coute
+URGENT_AFTER = 5.5           # au-dela, le bot prend des risques pour arriver a temps
+PANIC_AFTER = 7.5            # au-dela, chemin le plus court coute que coute
 
 # Couts de A* : la glace est infranchissable, les spheres sont "cheres" mais
 # franchissables quand le temps presse -> mouvements complexes et adaptatifs.
-COST_SPHERE = 40.0           # penalite case occupee par une sphere
-COST_PREDICT = 18.0          # penalite case juste devant une sphere
-COST_ADJACENT = 6.0          # penalite case adjacente a une sphere
+COST_SPHERE = 60.0           # penalite case occupee par une sphere
+COST_PREDICT = 30.0          # penalite case sur la trajectoire anticipee d'une boule
+COST_ADJACENT = 8.0          # penalite case adjacente a une sphere
 
 # Plages de couleurs en HSV (OpenCV: H 0-179, S 0-255, V 0-255)
 # Ajuste-les si besoin en observant les logs.
 ICE_LOW,    ICE_HIGH    = np.array([85,  40, 150]), np.array([110, 200, 255])   # bleu clair
 GREEN_LOW,  GREEN_HIGH  = np.array([70,  60,  40]), np.array([95,  255, 220])   # sphere verte/teal
 YELLOW_LOW, YELLOW_HIGH = np.array([22, 120, 150]), np.array([35,  255, 255])   # dalle jaune
+TAN_LOW,    TAN_HIGH    = np.array([8,   30, 130]), np.array([32,  120, 240])   # sol beige (detection auto)
 
 pyautogui.FAILSAFE = True    # bouge la souris dans un coin pour couper d'urgence
+pyautogui.PAUSE = 0          # pas de delai parasite : on gere le rythme nous-memes
 
 
 # ----------------------------------------------------------------------------
@@ -66,15 +74,12 @@ class State:
         self.running = False
         self.paused = False
         self.quit = False
-        # points de reference (centres de 3 cases) en coord ecran
-        self.p00 = None   # case (0,0)
-        self.p06 = None   # case (0,6)
-        self.p60 = None   # case (6,0)
-        self.origin = None
-        self.col_vec = None
-        self.row_vec = None
-        self.inv = None
-        self.player = (3, 3)          # position estimee du joueur (r,c)
+        # transformation affine du plateau (detectee automatiquement)
+        self.T = None                 # coin HAUT du sol (px absolus)
+        self.e1 = None                # vecteur +1 colonne (vers coin droit)
+        self.e2 = None                # vecteur +1 ligne (vers coin gauche)
+        self.invM = None              # inverse pour ecran -> case
+        self.player = (3, 3)          # position estimee du joueur (spawn = centre)
         self.prev_spheres = []        # spheres detectees a la frame precedente
         self.score = 0
         self.last_yellow = None
@@ -87,32 +92,66 @@ mouse_ctl = mouse.Controller()
 
 
 # ----------------------------------------------------------------------------
-# GEOMETRIE ISOMETRIQUE : ecran <-> grille
+# DETECTION AUTO DU PLATEAU + GEOMETRIE ISOMETRIQUE
 # ----------------------------------------------------------------------------
-def build_transform():
-    """Construit la transformation affine a partir des 3 points calibres."""
-    o = np.array(S.p00, dtype=float)
-    S.origin = o
-    S.col_vec = (np.array(S.p06, dtype=float) - o) / (GRID - 1)   # deplacement +1 colonne
-    S.row_vec = (np.array(S.p60, dtype=float) - o) / (GRID - 1)   # deplacement +1 ligne
-    M = np.array([[S.col_vec[0], S.row_vec[0]],
-                  [S.col_vec[1], S.row_vec[1]]], dtype=float)
-    S.inv = np.linalg.inv(M)
+def grab_fullscreen():
+    """Capture l'ecran principal en entier (pour detecter le plateau)."""
+    with mss.mss() as sct:
+        mon = sct.monitors[1]          # ecran principal
+        raw = sct.grab(mon)
+    img = np.array(raw)[:, :, :3]
+    return img, mon["left"], mon["top"]
+
+
+def detect_board():
+    """Detecte automatiquement le sol beige, en deduit les 4 coins du plateau
+    puis construit la transformation case <-> ecran. Le joueur spawn au centre."""
+    img, off_x, off_y = grab_fullscreen()
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, TAN_LOW, TAN_HIGH)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if n <= 1:
+        print("[BOT] !! sol beige introuvable - le jeu est-il bien visible ?")
+        return False
+    idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[idx, cv2.CC_STAT_AREA] < 20000:
+        print("[BOT] !! plateau trop petit / non trouve. Zoome le jeu.")
+        return False
+
+    comp = (lab == idx).astype(np.uint8)
+    cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    c = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(float)
+
+    top = c[np.argmin(c[:, 1])]
+    left = c[np.argmin(c[:, 0])]
+    right = c[np.argmax(c[:, 0])]
+
+    # coordonnees absolues ecran
+    S.T = np.array([top[0] + off_x, top[1] + off_y])
+    S.e1 = (np.array([right[0] + off_x, right[1] + off_y]) - S.T) / GRID
+    S.e2 = (np.array([left[0] + off_x, left[1] + off_y]) - S.T) / GRID
+    M = np.array([[S.e1[0], S.e2[0]], [S.e1[1], S.e2[1]]], dtype=float)
+    S.invM = np.linalg.inv(M)
 
     # zone de capture englobant les 49 cases + marge
-    pts = [cell_to_screen_abs(r, c) for r in range(GRID) for c in range(GRID)]
+    pts = [cell_to_screen_abs(r, cc) for r in range(GRID) for cc in range(GRID)]
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
-    left = int(min(xs) - MARGIN)
-    top = int(min(ys) - MARGIN)
-    width = int(max(xs) - min(xs) + 2 * MARGIN)
-    height = int(max(ys) - min(ys) + 2 * MARGIN)
-    S.bbox = {"top": top, "left": left, "width": width, "height": height}
+    S.bbox = {"left": int(min(xs) - MARGIN), "top": int(min(ys) - MARGIN),
+              "width": int(max(xs) - min(xs) + 2 * MARGIN),
+              "height": int(max(ys) - min(ys) + 2 * MARGIN)}
+
+    S.player = (3, 3)                  # spawn toujours au centre
+    print(f"[BOT] Plateau detecte. centre(3,3)={tuple(int(v) for v in cell_to_screen_abs(3,3))} "
+          f"| zone {S.bbox}")
+    return True
 
 
 def cell_to_screen_abs(r, c):
     """Centre d'une case (r,c) en coordonnees ecran absolues."""
-    p = S.origin + r * S.row_vec + c * S.col_vec
+    p = S.T + (c + 0.5) * S.e1 + (r + 0.5) * S.e2
     return (p[0], p[1])
 
 
@@ -126,9 +165,9 @@ def screen_local_to_cell(x, y):
     """Convertit un point (local a la capture) en case (r,c) arrondie."""
     abs_x = x + S.bbox["left"]
     abs_y = y + S.bbox["top"]
-    d = np.array([abs_x - S.origin[0], abs_y - S.origin[1]], dtype=float)
-    c, r = S.inv.dot(d)
-    return (int(round(r)), int(round(c)))
+    d = np.array([abs_x - S.T[0], abs_y - S.T[1]], dtype=float)
+    cc, rr = S.invM.dot(d)
+    return (int(round(rr - 0.5)), int(round(cc - 0.5)))
 
 
 def in_grid(r, c):
@@ -209,19 +248,36 @@ def estimate_sphere_dirs(spheres):
 
 def build_cost_map(spheres, dirs):
     """Carte de couts (7x7) : plus une case est dangereuse, plus elle coute cher.
-    On ne bloque pas totalement (sauf glace) pour garder des chemins evasifs
-    complexes et pouvoir passer en force quand le chrono l'exige."""
+    On projette chaque boule PREDICT_STEPS cases en avant (elles vont plus vite
+    que nous) pour anticiper la collision. On ne bloque pas totalement (sauf
+    glace) afin de garder des chemins evasifs et pouvoir forcer si le chrono
+    l'exige."""
     cost = {}
     for (r, c) in spheres:
         _bump(cost, r, c, COST_SPHERE)
         dr, dc = dirs.get((r, c), (0, 0))
-        for step in (1, 2):
+        for step in range(1, PREDICT_STEPS + 1):
             _bump(cost, r + dr * step, c + dc * step, COST_PREDICT / step)
         for ar in (-1, 0, 1):
             for ac in (-1, 0, 1):
                 if (ar, ac) != (0, 0):
                     _bump(cost, r + ar, c + ac, COST_ADJACENT)
     return cost
+
+
+def predicted_ball_cells(spheres, dirs):
+    """Cases que les boules occuperont tres bientot (a eviter absolument pour
+    le prochain pas), en tenant compte du ping et de leur vitesse superieure."""
+    reach = max(1, int(round(PREDICT_STEPS * BALL_FASTER)))
+    cells = set()
+    for (r, c) in spheres:
+        cells.add((r, c))
+        dr, dc = dirs.get((r, c), (0, 0))
+        for step in range(1, reach + 1):
+            nr, nc = r + dr * step, c + dc * step
+            if in_grid(nr, nc):
+                cells.add((nr, nc))
+    return cells
 
 
 def _bump(cost, r, c, val):
@@ -236,9 +292,28 @@ DIRS8 = [(-1, 0), (1, 0), (0, -1), (0, 1),
          (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
 
+def safe_step(start, goal, ice, soon):
+    """Choisit une case voisine sure (hors glace et hors trajectoire imminente
+    des boules) qui rapproche le plus du but. Sert a esquiver dans l'urgence."""
+    best = None
+    best_h = 1e9
+    for dr, dc in DIRS8:
+        nr, nc = start[0] + dr, start[1] + dc
+        if not in_grid(nr, nc) or (nr, nc) in ice or (nr, nc) in soon:
+            continue
+        if dr != 0 and dc != 0:
+            if (start[0] + dr, start[1]) in ice or (start[0], start[1] + dc) in ice:
+                continue
+        h = math.hypot(goal[0] - nr, goal[1] - nc)
+        if h < best_h:
+            best_h = h
+            best = (nr, nc)
+    return best
+
+
 def astar(start, goal, ice, danger, risk=1.0):
     """A* 8 directions. `ice` = infranchissable. `danger` = carte de couts.
-    `risk` module l'aversion au danger (1.0 normal, ~0.15 en panique)."""
+    `risk` module l'aversion au danger (1.0 normal, ~0.12 en panique)."""
     if start == goal:
         return [start]
     open_h = [(0.0, start)]
@@ -368,8 +443,8 @@ def bot_loop():
 
         ice_set = set(ice)
         danger = build_cost_map(spheres, dirs)
-        # ne jamais penaliser la case de depart
-        danger.pop(S.player, None)
+        danger.pop(S.player, None)          # ne jamais penaliser la case de depart
+        soon = predicted_ball_cells(spheres, dirs)   # cases boules imminentes
 
         path = astar(S.player, yellow, ice_set, danger, risk=risk)
         if not path:  # secours : ignore le danger, garde juste la glace
@@ -379,16 +454,21 @@ def bot_loop():
 
         if path and len(path) >= 2:
             nxt = path[1]
-            # securite : si la case visee est occupee par une sphere et qu'on
-            # n'est pas en panique, on attend une frame plutot que de foncer.
-            if nxt in spheres and mode == "SAFE":
-                time.sleep(LOOP_DELAY)
-                continue
+            # SECURITE : ne jamais entrer sur une case ou une boule sera dans
+            # l'instant (sauf PANIC ou il faut absolument atteindre la dalle).
+            if nxt in soon and mode != "PANIC":
+                # tente un pas d'esquive lateral sur une case sure, sinon attend
+                alt = safe_step(S.player, yellow, ice_set, soon)
+                if alt:
+                    nxt = alt
+                else:
+                    time.sleep(LOOP_DELAY)
+                    continue
             x, y = cell_to_screen_abs(*nxt)
             pyautogui.click(int(x), int(y))
             S.player = nxt
-            print(f"[BOT] {mode} t={remaining:4.1f}s pos->{nxt} but{yellow} "
-                  f"spheres{spheres} score={S.score}")
+            print(f"[BOT] {mode} t={remaining:4.1f}s ->{nxt} but{yellow} "
+                  f"boules{spheres} score={S.score}")
             time.sleep(CLICK_DELAY)
         else:
             time.sleep(LOOP_DELAY)
@@ -397,18 +477,8 @@ def bot_loop():
 
 
 # ----------------------------------------------------------------------------
-# CALIBRAGE (via position de la souris + touches 1/2/3/4)
+# DEMARRAGE (detection auto - plus de calibrage manuel)
 # ----------------------------------------------------------------------------
-def calibrate():
-    print("\n===== CALIBRAGE =====")
-    print("Place la SOURIS au CENTRE de la case demandee puis appuie sur la touche.")
-    print(" 1 -> coin haut  (case 0,0)")
-    print(" 2 -> case 0,6")
-    print(" 3 -> case 6,0")
-    print(" 4 -> case ou se trouve TON perso")
-    print("Le bot demarre tout seul apres la touche 4.\n")
-
-
 def on_press(key):
     try:
         k = key.char
@@ -425,35 +495,24 @@ def on_press(key):
         print(f"[BOT] {'PAUSE' if S.paused else 'REPRISE'}")
         return
 
-    if k == 'p' and not S.calibrated:
-        calibrate()
-        S.calibrating = True
-        return
-
-    if getattr(S, 'calibrating', False):
-        pos = mouse_ctl.position
-        if k == '1':
-            S.p00 = pos; print(f"  case (0,0) = {pos}")
-        elif k == '2':
-            S.p06 = pos; print(f"  case (0,6) = {pos}")
-        elif k == '3':
-            S.p60 = pos; print(f"  case (6,0) = {pos}")
-        elif k == '4':
-            if not (S.p00 and S.p06 and S.p60):
-                print("  !! calibre d'abord 1, 2 et 3 !!")
-                return
-            build_transform()
-            S.player = screen_local_to_cell(pos[0] - S.bbox["left"],
-                                            pos[1] - S.bbox["top"])
+    # 'p' : (re)detecte le plateau et (re)demarre
+    if k == 'p':
+        print("[BOT] Detection automatique du plateau...")
+        if detect_board():
             S.calibrated = True
-            S.calibrating = False
             S.running = True
-            print(f"  perso a {S.player} | zone capture {S.bbox}")
-            print("[BOT] Calibrage OK, demarrage !")
+            S.last_yellow = None
+            S.deadline = None
+            print("[BOT] Demarrage ! (space=pause, q=quitter, p=re-detecter)")
+        else:
+            print("[BOT] Echec detection. Verifie que le plateau est bien visible puis reappuie 'p'.")
+        return
 
 
 def main():
-    print("Pret. Ouvre le jeu, place la fenetre bien visible, puis appuie sur 'p'.")
+    print("Pret. Ouvre le jeu, place la fenetre du plateau bien visible,")
+    print("puis appuie sur 'p' : le bot detecte le plateau et joue tout seul.")
+    print("(space = pause/reprise, q = quitter, p = re-detecter le plateau)")
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     bot_loop()
