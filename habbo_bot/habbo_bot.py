@@ -46,6 +46,7 @@ SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 DIAGONALS = True             # autoriser les deplacements en diagonale
 TEMPORIZE = True             # attendre pres de la dalle et toucher au dernier moment
 DODGE = True                 # esquiver activement (anticipation des boules)
+IMITATE = False              # rejouer TON style appris en mode spectateur
 
 # Anticipation des boules (le point cle demande) :
 #   rayon MORTEL   = collision certaine -> case totalement interdite
@@ -70,6 +71,14 @@ CAUTION_STEP = 0.12          # prudence gagnee a chaque mort (0..1)
 CAUTION_HARD_TH = 0.45       # au-dela (ou situation deja mortelle), rayon mortel = 2
 LEARN_COST = 1.5             # cout de pathfinding ajoute par mort memorisee sur une case
 LEARN_MAX = 8.0              # plafond du cout "appris" pour une case
+
+# Apprentissage par DEMONSTRATION (mode spectateur) : le bot te regarde jouer,
+# enregistre (etat du jeu -> ta direction) puis peut IMITER ton style (k-NN).
+DEMO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "habbo_bot_demos.json")
+DEMO_MAX = 8000              # nb max de coups memorises (fichier leger)
+IMIT_K = 5                   # nb de voisins consideres pour le vote d'imitation
+IMIT_MAXDIST = 6.0           # distance^2 max pour juger une situation "ressemblante"
 NO_YELLOW_DEATH = 25         # frames sans dalle -> partie terminee (mort/timeout)
 MOTION_TH = 22               # seuil de mouvement pour tracker l'avatar
 AVATAR_MIN_AREA = 250        # aire mini du blob avatar (mouvement)
@@ -136,6 +145,12 @@ class State:
         self.last_lesson = ""         # resume lisible du dernier apprentissage (sortie IA)
         self.avg_survival = 0.0       # score moyen avant de mourir
         self.danger_zones = 0         # nb de cases apprises comme dangereuses
+        # apprentissage par demonstration (mode spectateur / imitation)
+        self.observe = False          # mode spectateur : on te regarde jouer (aucun clic)
+        self.demos = []               # coups appris : [{"f":[features], "a":[dr,dc]}]
+        self.demo_count = 0           # nb de coups appris (affiche)
+        self.obs_prev_cell = None     # case du joueur a la frame precedente (observe)
+        self.obs_prev_feat = None     # etat a la frame precedente (observe)
         self.no_yellow = 0            # compteur de frames sans dalle
         self.playing = False          # une partie est en cours
         self.reached = False          # contact deja compte pour la dalle courante
@@ -192,6 +207,27 @@ def save_memory():
                        "cell_deaths": {f"{r},{c}": round(n, 2)
                                        for (r, c), n in S.cell_deaths.items()},
                        "run_scores": S.run_scores[-50:]}, f)
+    except OSError:
+        pass
+
+
+def load_demos():
+    """Charge tes coups appris (demonstrations) pour l'imitation."""
+    try:
+        with open(DEMO_FILE, "r") as f:
+            d = json.load(f)
+        S.demos = d.get("demos", [])
+        S.demo_count = len(S.demos)
+        if S.demo_count:
+            print(f"[BOT] Demonstrations chargees : {S.demo_count} de tes coups appris.")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+def save_demos():
+    try:
+        with open(DEMO_FILE, "w") as f:
+            json.dump({"demos": S.demos[-DEMO_MAX:]}, f)
     except OSError:
         pass
 
@@ -889,6 +925,62 @@ def draw_debug(img, ice, spheres, yellow, path, mode, remaining):
 
 
 # ----------------------------------------------------------------------------
+# IMITATION (apprentissage par demonstration : rejoue TON style)
+# ----------------------------------------------------------------------------
+def state_features(balls, player, goal):
+    """Vecteur d'etat relatif au joueur : direction vers la dalle + les 2 boules
+    les plus proches (position + direction). Sert a comparer les situations."""
+    pr, pc = player
+    feat = [float(goal[0] - pr), float(goal[1] - pc)]
+    near = sorted(balls, key=lambda b: (b.cell[0] - pr) ** 2 + (b.cell[1] - pc) ** 2)
+    for i in range(2):
+        if i < len(near):
+            b = near[i]
+            feat += [float(b.cell[0] - pr), float(b.cell[1] - pc),
+                     float(b.dir[0]), float(b.dir[1])]
+        else:
+            feat += [9.0, 9.0, 0.0, 0.0]      # pas de boule -> sentinelle "loin"
+    return feat
+
+
+def imitate_action(feat, k=IMIT_K):
+    """k-NN sur tes demonstrations : renvoie la direction que TU aurais prise dans
+    la situation la plus proche (vote pondere par la distance). None si aucune
+    situation memorisee n'est assez ressemblante (> IMIT_MAXDIST)."""
+    if not S.demos:
+        return None
+    scored = []
+    for d in S.demos:
+        f = d["f"]
+        dist = 0.0
+        for a, b in zip(feat, f):
+            dist += (a - b) * (a - b)
+        scored.append((dist, d["a"]))
+    scored.sort(key=lambda x: x[0])
+    if scored[0][0] > IMIT_MAXDIST:
+        return None
+    votes = {}
+    for dist, a in scored[:k]:
+        key = (int(a[0]), int(a[1]))
+        votes[key] = votes.get(key, 0.0) + 1.0 / (1.0 + dist)
+    return max(votes, key=votes.get)
+
+
+def _safe_neighbor(start, cell, ice, soon):
+    """`cell` est-elle un pas voisin sur (dans la grille, hors glace, hors danger
+    imminent, sans couper un coin de glace en diagonale) ?"""
+    if not in_grid(*cell) or cell in ice or cell in soon:
+        return False
+    dr, dc = cell[0] - start[0], cell[1] - start[1]
+    if abs(dr) > 1 or abs(dc) > 1:
+        return False
+    if dr != 0 and dc != 0:
+        if (start[0] + dr, start[1]) in ice or (start[0], start[1] + dc) in ice:
+            return False
+    return True
+
+
+# ----------------------------------------------------------------------------
 # BOUCLE PRINCIPALE
 # ----------------------------------------------------------------------------
 def bot_loop():
@@ -942,6 +1034,32 @@ def bot_loop():
                 S.player = cell               # position REELLE de l'habbo
         else:
             S.prev_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # --- MODE SPECTATEUR : le bot te REGARDE jouer et apprend tes coups
+        #     (aucun clic). A chaque changement de case, on memorise
+        #     (etat precedent -> ta direction) pour pouvoir IMITER ton style.
+        if S.observe:
+            if yellow is not None:
+                feat = state_features(balls, S.player, yellow)
+                if (S.obs_prev_cell is not None and S.obs_prev_feat is not None
+                        and S.player != S.obs_prev_cell):
+                    dr = int(np.sign(S.player[0] - S.obs_prev_cell[0]))
+                    dc = int(np.sign(S.player[1] - S.obs_prev_cell[1]))
+                    if (dr, dc) != (0, 0):
+                        S.demos.append({"f": S.obs_prev_feat, "a": [dr, dc]})
+                        if len(S.demos) > DEMO_MAX:
+                            S.demos = S.demos[-DEMO_MAX:]
+                        S.demo_count = len(S.demos)
+                        if S.demo_count % 25 == 0:
+                            save_demos()
+                S.obs_prev_cell = S.player
+                S.obs_prev_feat = feat
+            S.mode = "OBSERVE"
+            S.act = "WATCH"
+            S.nballs = len(balls)
+            draw_debug(img, ice_set, spheres, yellow, None, "OBSERVE", 0.0)
+            time.sleep(LOOP_DELAY)
+            continue
 
         if yellow is None:
             # pas de dalle : soit teleport (clignotement bref), soit MORT (reset).
@@ -1018,13 +1136,29 @@ def bot_loop():
         travel = ((len(path) - 1) / MOVE_SPEED + CLICK_LATENCY) if (path and len(path) >= 2) else 99.0
         my_safe = safe_until(S.player, hard)
 
+        # IMITATION : dans une situation qui ressemble a ce que TU as deja fait
+        # (mode SAFE, hors danger imminent), rejoue TON coup. Securite anti-mort :
+        # on ne bouge que vers une case voisine sure (sinon on laisse l'algo decider).
+        imit_cell = None
+        if IMITATE and S.demos and mode == "SAFE" and my_safe > 2 and not S.reached:
+            act_i = imitate_action(state_features(balls, S.player, yellow))
+            if act_i and act_i != (0, 0):
+                cand = (S.player[0] + act_i[0], S.player[1] + act_i[1])
+                if _safe_neighbor(S.player, cand, ice_set, soon) and cand not in soft[1]:
+                    imit_cell = cand
+
         # FONCER vers la dalle seulement si : le temps presse, panique, ou rester
         # ici devient dangereux. Sinon on TEMPORISE (on attend une ouverture).
         must_go = (remaining <= travel + HOLD_BUFFER) or mode == "PANIC" or my_safe <= 2
         if not TEMPORIZE:
             must_go = True                         # temporisation desactivee -> foncer
 
-        if must_go and path and len(path) >= 2:
+        if imit_cell is not None:
+            # rejoue TON style (un pas dans la direction apprise)
+            target = step_cell = imit_cell
+            S.commit = None
+            act = "IMIT"
+        elif must_go and path and len(path) >= 2:
             if path[1] in soon and mode != "PANIC":
                 # une boule va bloquer/toucher -> CHANGE de direction tout de suite.
                 ev = safe_step(S.player, yellow, ice_set, soon)
@@ -1094,6 +1228,7 @@ def on_press(key):
         if detect_board():
             S.calibrated = True
             S.running = True
+            S.observe = False
             S.last_yellow = None
             S.deadline = None
             S.move_accum = 0.0
@@ -1119,16 +1254,31 @@ def on_press(key):
         capture_face(grab_frame())
         return
 
+    # 'o' : mode spectateur (le bot te regarde jouer et apprend tes coups)
+    if k == 'o':
+        print("[BOT] Detection du plateau (mode spectateur)...")
+        if detect_board():
+            S.calibrated = True
+            S.observe = True
+            S.obs_prev_cell = None
+            S.obs_prev_feat = None
+            S.running = True
+            print("[BOT] MODE SPECTATEUR : joue normalement, j'apprends tes coups. "
+                  "(p=jouer, space=pause, q=quitter)")
+        return
+
 
 def main():
     print("Pret. Ouvre le jeu, place la fenetre du plateau bien visible,")
     print("puis appuie sur 'p' : le bot detecte le plateau et joue tout seul.")
     print("(space = pause/reprise, q = quitter, p = re-detecter le plateau)")
     load_memory()                       # apprentissage anti-mort persistant
+    load_demos()                        # coups appris (imitation) persistants
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     bot_loop()
     listener.stop()
+    save_demos()
     cv2.destroyAllWindows()
 
 

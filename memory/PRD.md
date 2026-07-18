@@ -52,6 +52,14 @@ apprentissage anti-mort heuristique (pas de réseau de neurones).
   - persistance JSON chargée aussi au démarrage de la GUI.
 - Lanceurs `.bat` verbeux + vérification Tkinter + fenêtre d'erreur au lieu de plantage
   silencieux. `lancer_bot.bat` ouvre maintenant directement la GUI.
+- **Mode Apprentissage spectateur + Imitation (learning from demonstration)** :
+  - bouton « 👁 Observer & apprendre de MOI » (touche O) : le bot regarde l'utilisateur
+    jouer sans cliquer et enregistre (état → sa direction) dans `habbo_bot_demos.json`,
+  - toggle « Imiter mon style » : k-NN sur les démonstrations → rejoue la décision de
+    l'utilisateur dans les situations similaires, avec **sécurité anti-mort** (fallback
+    A*) et retour à l'algo en URGENT/PANIC pour garantir l'objectif,
+  - curseur « Imitation : tolerance » (IMIT_MAXDIST), compteur « Coups appris » dans le
+    panneau IA. Imitation-par-mémoire (choix utilisateur), ZÉRO nouvelle dépendance.
 
 ## Historique décisions
 - Face-tracking / gating de tour : implémenté puis jugé peu fiable par l'utilisateur.
@@ -69,4 +77,6 @@ apprentissage anti-mort heuristique (pas de réseau de neurones).
 ## Statut de test
 - Logique d'apprentissage : testée headless (libs stubées) — /tmp/test_learning.py — OK
   (heatmap, prudence adaptative, persistance, évitement proactif via A*).
+- Logique d'imitation : testée headless — /tmp/test_imitation.py — OK
+  (state_features, k-NN + vote, tolérance, _safe_neighbor anti-mort, persistance demos).
 - GUI Tkinter + lanceurs `.bat` : NON testables sur serveur → validation utilisateur Windows.

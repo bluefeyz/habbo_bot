@@ -49,6 +49,22 @@ Le panneau **« IA – Apprentissage »** montre en direct ce que le bot apprend
 Tout est sauvegardé dans `habbo_bot_memory.json` et **persiste entre les sessions** :
 plus tu joues, mieux il anticipe.
 
+### 👁 Mode Apprentissage (spectateur) + « Imiter mon style »
+Le bot peut **apprendre en te regardant jouer** (apprentissage par démonstration,
+100 % local, sans dépendance lourde) :
+1. Clique sur **« 👁 Observer & apprendre de MOI »** (ou touche **O**). Le bot
+   **ne clique pas** : il te regarde et enregistre tes coups (situation → ta
+   direction) dans `habbo_bot_demos.json`. Joue plusieurs parties normalement.
+2. Clique sur **Stop** (S) quand tu as fini : tes coups sont sauvegardés.
+3. Coche le toggle **« Imiter mon style »**, puis lance le bot avec **Démarrer**
+   (P). Dans les situations qui **ressemblent** à ce que tu as fait, il **rejoue
+   ta décision**. Une **sécurité anti-mort** reste active : s'il n'y a pas de coup
+   sûr, l'algorithme A* reprend la main, et il fonce toucher la dalle quand le
+   chrono l'exige.
+- Le curseur **« Imitation : tolerance »** règle à quel point une situation doit
+  ressembler pour rejouer ton coup (petit = strict, grand = imite plus souvent).
+- Le panneau IA affiche **« Coups appris de toi »** et l'état **Imitation ON/OFF**.
+
 ## 4. Si la détection est mauvaise
 Ouvre `habbo_bot.py` et ajuste les **plages de couleurs HSV** en haut du fichier
 (`ICE_LOW/HIGH`, `GREEN_LOW/HIGH`, `YELLOW_LOW/HIGH`). Les logs affichés dans la

@@ -61,6 +61,7 @@ SLIDERS = [
     ("UNC_GROW", "Incertitude boules (petit = prudent)", 1, 8, 1),
     ("URGENT_AFTER", "Passage URGENT a (s ecoulees)", 3.0, 9.0, 0.5),
     ("PANIC_AFTER", "Passage PANIC a (s ecoulees)", 4.0, 9.5, 0.5),
+    ("IMIT_MAXDIST", "Imitation : tolerance (petit = strict)", 1.0, 30.0, 1.0),
     ("FACE_TH", "(inutilise) seuil visage", 0.3, 0.9, 0.05),
 ]
 
@@ -68,6 +69,7 @@ TOGGLES = [
     ("DIAGONALS", "Diagonales (gagne de l'espace)"),
     ("TEMPORIZE", "Temporiser (attendre sur/pres de la dalle)"),
     ("DODGE", "Esquiver activement les boules"),
+    ("IMITATE", "Imiter mon style (rejoue mes coups appris)"),
     ("SHOW_DEBUG", "Fenetre de debug (grille live)"),
 ]
 
@@ -102,11 +104,18 @@ class App:
         tk.Label(
             root,
             text=("Raccourcis clavier (marchent aussi quand le JEU a le focus) :  "
-                  "P = Calibrer & Demarrer   Espace = Pause/Reprendre   "
+                  "P = Demarrer   O = Observer   Espace = Pause   "
                   "S = Stop   R = Recalibrer   Q = Quitter"),
             font=("Consolas", 8), fg="#6272a4", bg="#12141c",
             justify="left", wraplength=540,
         ).pack(fill="x", padx=12, pady=(3, 0))
+
+        obsrow = tk.Frame(root, bg="#12141c")
+        obsrow.pack(fill="x", padx=8)
+        tk.Button(obsrow, text="👁  Observer & apprendre de MOI (O)", command=self.observe,
+                  bg="#bd93f9", fg="#12141c", relief="flat",
+                  font=("Consolas", 10, "bold"), padx=6, pady=6
+                  ).pack(fill="x", padx=3, pady=(4, 2))
 
         # --- panneau IA / apprentissage (sortie visible) ---------------------
         af = tk.LabelFrame(root, text="IA - Apprentissage (apprend de ses morts)",
@@ -183,6 +192,8 @@ class App:
             self.toggle_pause()
         elif k == 'p':
             self.start()
+        elif k == 'o':
+            self.observe()
         elif k == 's':
             self.stop()
         elif k == 'r':
@@ -219,7 +230,7 @@ class App:
         self.status.config(text=f"Preset applique : {name}")
 
     # ---------------------------------------------------------------- actions
-    def start(self):
+    def _launch(self, observe):
         def do():
             if bot.detect_board():
                 bot.S.last_yellow = None
@@ -234,10 +245,19 @@ class App:
                 bot.S.prev_gray = None
                 bot.S.commit = None
                 bot.S.commit_dir = (0, 0)
+                bot.S.obs_prev_cell = None
+                bot.S.obs_prev_feat = None
                 bot.tracker.reset()
+                bot.S.observe = observe
                 bot.S.paused = False
                 bot.S.running = True
         threading.Thread(target=do, daemon=True).start()
+
+    def start(self):
+        self._launch(observe=False)
+
+    def observe(self):
+        self._launch(observe=True)
 
     def recalib(self):
         threading.Thread(target=lambda: bot.detect_board(), daemon=True).start()
@@ -247,6 +267,8 @@ class App:
 
     def stop(self):
         bot.S.running = False
+        bot.S.observe = False
+        bot.save_demos()          # sauvegarde les coups appris de toi
 
     # ------------------------------------------------------------------- live
     def refresh(self):
@@ -268,6 +290,8 @@ class App:
             f"Situations connues : {len(s.death_mem)}\n"
             f"Zones dangereuses apprises : {s.danger_zones}    "
             f"Survie moyenne : {s.avg_survival:.1f} pts\n"
+            f"Coups appris de toi : {s.demo_count}    "
+            f"Imitation : {'ON' if bot.IMITATE else 'OFF'}\n"
             f"Derniere lecon : {s.last_lesson or '(aucune mort encore)'}"
         ))
         self.root.after(120, self.refresh)
@@ -288,6 +312,7 @@ def main():
 
     try:
         bot.load_memory()          # charge l'apprentissage persistant (morts, zones apprises)
+        bot.load_demos()           # charge tes coups appris (imitation)
         # demarre la boucle du bot en tache de fond (elle attend running=True)
         threading.Thread(target=bot.bot_loop, daemon=True).start()
         root = tk.Tk()
