@@ -102,6 +102,8 @@ class State:
         self.pre_sig = None           # signature de la derniere frame jouee
         self.no_yellow = 0            # compteur de frames sans dalle
         self.playing = False          # une partie est en cours
+        self.reached = False          # contact deja compte pour la dalle courante
+        self.yellow_gone = False      # la dalle a disparu (teleport/clignotement)
 
 
 S = State()
@@ -414,6 +416,8 @@ def register_death():
     S.player = (3, 3)
     S.move_accum = 0.0
     S.pre_sig = None
+    S.reached = False
+    S.yellow_gone = False
     tracker.reset()
 
 
@@ -654,8 +658,9 @@ def bot_loop():
         yellow = detect_yellow(hsv)
 
         if yellow is None:
-            # pas de dalle : soit entre deux parties, soit MORT (plateau reset).
+            # pas de dalle : soit teleport (clignotement bref), soit MORT (reset).
             S.no_yellow += 1
+            S.yellow_gone = True          # elle a disparu -> prochaine = nouvelle
             if S.playing and S.no_yellow >= NO_YELLOW_DEATH:
                 register_death()
             time.sleep(LOOP_DELAY)
@@ -663,17 +668,23 @@ def bot_loop():
         S.no_yellow = 0
         S.playing = True
 
-        # nouvelle dalle -> +1 score, chrono relance, RE-SYNC : le perso est
-        # forcement sur l'ancienne dalle qu'il vient de toucher.
-        if S.last_yellow is None or yellow != S.last_yellow:
-            if S.last_yellow is not None:
-                S.score += 1
-                S.best_score = max(S.best_score, S.score)
-                S.player = S.last_yellow      # re-synchronisation fiable
-                S.move_accum = 0.0
-                print(f"[BOT] Dalle atteinte ! Score = {S.score} (best {S.best_score})")
-            S.deadline = time.time() + TIME_LIMIT
+        # --- NOUVELLE INSTANCE de dalle ? (elle a bouge OU a clignote au teleport)
+        if (S.last_yellow is not None and yellow != S.last_yellow) or S.yellow_gone:
+            S.reached = False             # on pourra re-compter un contact
+        S.yellow_gone = False
         S.last_yellow = yellow
+        if S.deadline is None:
+            S.deadline = time.time() + TIME_LIMIT
+
+        # --- CONTACT : detecte par l'ARRIVEE sur la dalle (marche meme si la
+        # nouvelle dalle re-apparait AU MEME endroit ou juste a cote).
+        if not S.reached and S.player == yellow:
+            S.score += 1
+            S.best_score = max(S.best_score, S.score)
+            S.deadline = time.time() + TIME_LIMIT   # chrono relance a 10 s
+            S.reached = True
+            S.move_accum = 0.0
+            print(f"[BOT] Dalle atteinte ! Score = {S.score} (best {S.best_score})")
 
         # temps restant -> mode (autorise a forcer si le chrono l'exige)
         remaining = (S.deadline - time.time()) if S.deadline else TIME_LIMIT
@@ -768,6 +779,8 @@ def on_press(key):
             S.no_yellow = 0
             S.playing = False
             S.score = 0
+            S.reached = False
+            S.yellow_gone = False
             tracker.reset()
             print("[BOT] Demarrage ! (space=pause, q=quitter, p=re-detecter)")
         else:
