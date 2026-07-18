@@ -52,6 +52,12 @@ SOFT_COST = 3.5             # cout d'une case dans la zone d'anticipation (doux)
 SANDWICH_COST = 12.0        # cout supplementaire d'une case prise en tenaille
 TURN_COST = 0.8             # penalite de changement de direction -> preferer tout droit
 
+# Temporisation : pas besoin de se presser. On attend dans une case sure proche
+# de la dalle, et on ne fonce la toucher qu'au dernier moment (marge de securite).
+HOLD_BUFFER = 1.6           # secondes de marge avant la deadline pour foncer
+UNC_GROW = 3                # la zone d'anticipation s'elargit tous les N pas
+                            # (les boules peuvent tourner -> incertitude au loin)
+
 # Apprentissage "anti-mort" (leger, sans entrainement, memoire persistante)
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "habbo_bot_memory.json")
@@ -539,7 +545,10 @@ def predict_occupancy(balls, ice, horizon, player_speed, hard_r=1, soft_r=2):
         ratio = max(0.3, b.speed / max(0.1, player_speed)) if b.speed > 0 else 1.0
         acc = 0.0
         for t in range(horizon + 1):
-            add_ring(soft, t, r, c, soft_r)
+            # l'incertitude grandit avec le temps (la boule peut tourner) :
+            # la zone d'anticipation s'elargit au loin.
+            grow = t // UNC_GROW
+            add_ring(soft, t, r, c, min(soft_r + grow, 3))
             add_ring(hard, t, r, c, hard_r)
             balls_at[t].append((r, c))
             acc += ratio
@@ -556,6 +565,46 @@ def predict_occupancy(balls, ice, horizon, player_speed, hard_r=1, soft_r=2):
                         break
                 r, c = nr, nc
     return hard, soft, balls_at
+
+
+def safe_until(cell, hard):
+    """Nombre de pas avant que `cell` devienne mortelle (grand = tres sur)."""
+    for t in range(len(hard)):
+        if cell in hard[t]:
+            return t
+    return len(hard)
+
+
+def best_hold_cell(player, goal, ice, hard, soft, sandwich):
+    """Case ou TEMPORISER : la plus sûre possible (reste hors danger longtemps),
+    proche de la dalle, sans osciller pour rien. Permet d'attendre une ouverture
+    au lieu de foncer. Renvoie la case a viser (peut etre la case actuelle)."""
+    cands = [player]
+    for dr, dc in DIRS8:
+        nr, nc = player[0] + dr, player[1] + dc
+        if not in_grid(nr, nc) or (nr, nc) in ice:
+            continue
+        if dr != 0 and dc != 0:
+            if (player[0] + dr, player[1]) in ice or (player[0], player[1] + dc) in ice:
+                continue
+        cands.append((nr, nc))
+    best, bscore = player, -1e9
+    for cell in cands:
+        if cell != player and cell in hard[1]:      # ne pas entrer dans un mortel imminent
+            continue
+        if cell == goal and cell != player:         # on TEMPORISE a cote, pas dessus
+            continue
+        score = 10.0 * safe_until(cell, hard)        # priorite : rester sûr longtemps
+        score -= 1.4 * math.hypot(goal[0] - cell[0], goal[1] - cell[1])  # rester pres de la dalle
+        if cell in soft[1]:
+            score -= 4.0
+        if cell in sandwich:
+            score -= 12.0
+        if cell == player:
+            score += 1.5                             # inertie : ne pas bouger pour rien
+        if score > bscore:
+            bscore, best = score, cell
+    return best
 
 
 def sandwich_cells(balls_at_t):
@@ -881,8 +930,17 @@ def bot_loop():
 
         target = None       # case a CLIQUER (peut etre loin)
         step_cell = None    # case vers laquelle le modele avance ce tick
+        act = mode
 
-        if path and len(path) >= 2:
+        # Temps estime pour rejoindre la dalle + duree de securite de ma case.
+        travel = ((len(path) - 1) / MOVE_SPEED + CLICK_LATENCY) if (path and len(path) >= 2) else 99.0
+        my_safe = safe_until(S.player, hard)
+
+        # FONCER vers la dalle seulement si : le temps presse, panique, ou rester
+        # ici devient dangereux. Sinon on TEMPORISE (on attend une ouverture).
+        must_go = (remaining <= travel + HOLD_BUFFER) or mode == "PANIC" or my_safe <= 2
+
+        if must_go and path and len(path) >= 2:
             if path[1] in soon and mode != "PANIC":
                 # une boule va bloquer/toucher -> CHANGE de direction tout de suite.
                 ev = safe_step(S.player, yellow, ice_set, soon)
@@ -897,20 +955,29 @@ def bot_loop():
                 target = commit_target(path, soon)   # clic loin en ligne droite
                 step_cell = path[1]
                 S.commit = target
-            if step_cell:
-                S.commit_dir = (int(np.sign(step_cell[0] - S.player[0])),
-                                int(np.sign(step_cell[1] - S.player[1])))
+            act = "GO"
+        else:
+            # TEMPORISER : attendre dans la case la plus sûre proche de la dalle.
+            hold = best_hold_cell(S.player, yellow, ice_set, hard, soft, sandwich)
+            S.commit = None
+            act = "HOLD"
+            if hold != S.player:
+                target = step_cell = hold            # petit repositionnement d'esquive
+            # sinon target=None -> immobile, on attend l'ouverture
+
+        if step_cell:
+            S.commit_dir = (int(np.sign(step_cell[0] - S.player[0])),
+                            int(np.sign(step_cell[1] - S.player[1])))
 
         if target:
             x, y = cell_to_screen_abs(*target)
             pyautogui.click(int(x), int(y))          # clic loin : le perso y va
-            # suivi du modele dans le temps (avance vers la case suivante)
             S.move_accum += dt * MOVE_SPEED
             if S.move_accum >= 1.0 and step_cell:
                 S.move_accum -= 1.0
                 S.player = step_cell
-            print(f"[BOT] {mode} t={remaining:4.1f}s clic->{target} pas->{step_cell} "
-                  f"but{yellow} boules{spheres} score={S.score}")
+            print(f"[BOT] {act} t={remaining:4.1f}s clic->{target} but{yellow} "
+                  f"boules{spheres} score={S.score}")
             time.sleep(CLICK_DELAY)
         else:
             time.sleep(LOOP_DELAY)
@@ -954,7 +1021,6 @@ def on_press(key):
             S.commit = None
             S.commit_dir = (0, 0)
             S.turn_miss = 0
-            capture_face(grab_frame())     # ton perso doit etre au CENTRE
             tracker.reset()
             print("[BOT] Demarrage ! (p=re-detecter/recapturer, f=recapturer visage, "
                   "space=pause, q=quitter)")
