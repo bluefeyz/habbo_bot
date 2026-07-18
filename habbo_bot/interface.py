@@ -12,10 +12,18 @@ Lance simplement ce fichier (ou lancer_interface.bat).
 """
 
 import threading
+import traceback
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
-import habbo_bot as bot
+# On protege l'import : si une dependance manque (opencv, pyautogui, pynput...),
+# on affiche une fenetre d'erreur claire au lieu de rester bloque en console.
+try:
+    import habbo_bot as bot
+    IMPORT_ERROR = None
+except Exception:
+    bot = None
+    IMPORT_ERROR = traceback.format_exc()
 
 
 # ---- Presets (valeurs appliquees aux parametres du bot) ---------------------
@@ -208,12 +216,35 @@ class App:
 
 
 def main():
-    # demarre la boucle du bot en tache de fond (elle attend running=True)
-    threading.Thread(target=bot.bot_loop, daemon=True).start()
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
-    bot.S.quit = True
+    # Dependance manquante -> fenetre d'erreur lisible (au lieu de planter en console).
+    if IMPORT_ERROR is not None:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Habbo Bot - dependance manquante",
+            "L'interface n'a pas pu charger le bot.\n\n"
+            "Il manque probablement une bibliotheque (opencv / pyautogui / pynput).\n"
+            "Relance 'lancer_interface.bat' : il installe tout automatiquement.\n\n"
+            "Detail technique :\n" + IMPORT_ERROR[-600:])
+        return
+
+    try:
+        # demarre la boucle du bot en tache de fond (elle attend running=True)
+        threading.Thread(target=bot.bot_loop, daemon=True).start()
+        root = tk.Tk()
+        App(root)
+        root.mainloop()
+        bot.S.quit = True
+    except Exception:
+        err = traceback.format_exc()
+        print(err)
+        try:
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showerror("Habbo Bot - erreur au demarrage",
+                                 "L'interface n'a pas pu s'ouvrir.\n\n" + err[-600:])
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
