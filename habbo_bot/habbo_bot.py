@@ -34,6 +34,7 @@ CLICK_DELAY = 0.03           # spam de clics : delai mini entre 2 clics
 LOOP_DELAY = 0.006           # pause entre deux analyses d'image (reactivite max)
 CLICK_LATENCY = 0.10         # ping du jeu (~100 ms) : compense la prediction des boules
 MOVE_SPEED = 3.0             # vitesse estimee du perso (cases/seconde) pour le suivi
+HORIZON = 14                 # nb de pas anticipes (planification espace-temps)
 PATCH = 6                    # demi-taille du carre echantillonne au centre d'une case
 SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
@@ -231,64 +232,132 @@ def detect_yellow(hsv):
     return cells[0] if cells else None
 
 
-def estimate_sphere_dirs(spheres):
-    """Estime la direction de chaque sphere en la comparant a la frame precedente."""
-    dirs = {}
-    for (r, c) in spheres:
-        best = None
-        best_d = 99
-        for (pr, pc) in S.prev_spheres:
-            d = abs(pr - r) + abs(pc - c)
-            if d < best_d:
-                best_d = d
-                best = (pr, pc)
-        if best and best != (r, c):
-            dr = np.sign(r - best[0])
-            dc = np.sign(c - best[1])
-            dirs[(r, c)] = (int(dr), int(dc))
-        else:
-            dirs[(r, c)] = (0, 0)
-    return dirs
+def detect_blob_pixels(hsv, low, high):
+    """Centroides des blobs d'une couleur, en pixels LOCAUX (sub-case)."""
+    mask = color_mask(hsv, low, high)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    pts = []
+    for cnt in cnts:
+        if cv2.contourArea(cnt) < SPHERE_MIN_AREA:
+            continue
+        m = cv2.moments(cnt)
+        if m["m00"] == 0:
+            continue
+        pts.append((m["m10"] / m["m00"], m["m01"] / m["m00"]))
+    return pts
 
 
-def build_cost_map(spheres, dirs):
-    """Carte de couts (7x7) : plus une case est dangereuse, plus elle coute cher.
-    On projette chaque boule PREDICT_STEPS cases en avant (elles vont plus vite
-    que nous) pour anticiper la collision. On ne bloque pas totalement (sauf
-    glace) afin de garder des chemins evasifs et pouvoir forcer si le chrono
-    l'exige."""
-    cost = {}
-    for (r, c) in spheres:
-        _bump(cost, r, c, COST_SPHERE)
-        dr, dc = dirs.get((r, c), (0, 0))
-        for step in range(1, PREDICT_STEPS + 1):
-            _bump(cost, r + dr * step, c + dc * step, COST_PREDICT / step)
+def local_to_gridf(x, y):
+    """Pixel local -> coordonnees grille CONTINUES (row_f, col_f)."""
+    d = np.array([x + S.bbox["left"] - S.T[0], y + S.bbox["top"] - S.T[1]], dtype=float)
+    cc, rr = S.invM.dot(d)
+    return (rr - 0.5, cc - 0.5)
+
+
+# ----------------------------------------------------------------------------
+# TRACKER DE BOULES : ID persistant + direction/vitesse mesurees
+# ----------------------------------------------------------------------------
+class Ball:
+    __slots__ = ("rf", "cf", "vr", "vc", "dir", "speed", "miss")
+
+    def __init__(self, rf, cf):
+        self.rf, self.cf = rf, cf      # position continue (row, col)
+        self.vr, self.vc = 0.0, 0.0    # vitesse lissee (cases/s)
+        self.dir = (0, 0)              # direction 4-dir figee
+        self.speed = 0.0               # vitesse scalaire (cases/s)
+        self.miss = 0                  # frames sans detection
+
+    @property
+    def cell(self):
+        return (int(round(self.rf)), int(round(self.cf)))
+
+
+class BallTracker:
+    MATCH_DIST = 1.6     # distance max (cases) pour associer une detection a un track
+    EMA = 0.5            # lissage de la vitesse
+    MIN_SPEED = 0.4      # en dessous, on garde l'ancienne direction
+
+    def __init__(self):
+        self.balls = []
+
+    def reset(self):
+        self.balls = []
+
+    def update(self, dets, dt):
+        """dets = liste de (row_f, col_f). Associe, met a jour vitesse+direction."""
+        used = [False] * len(dets)
+        for b in self.balls:
+            best, bd = -1, 1e9
+            for i, (rf, cf) in enumerate(dets):
+                if used[i]:
+                    continue
+                d = math.hypot(rf - b.rf, cf - b.cf)
+                if d < bd:
+                    bd, best = d, i
+            if best >= 0 and bd <= self.MATCH_DIST:
+                rf, cf = dets[best]
+                used[best] = True
+                if dt > 0:
+                    vr, vc = (rf - b.rf) / dt, (cf - b.cf) / dt
+                    b.vr = self.EMA * vr + (1 - self.EMA) * b.vr
+                    b.vc = self.EMA * vc + (1 - self.EMA) * b.vc
+                b.rf, b.cf = rf, cf
+                b.speed = max(abs(b.vr), abs(b.vc))
+                if b.speed >= self.MIN_SPEED:      # boule H/V -> axe dominant
+                    if abs(b.vc) >= abs(b.vr):
+                        b.dir = (0, int(np.sign(b.vc)))
+                    else:
+                        b.dir = (int(np.sign(b.vr)), 0)
+                b.miss = 0
+            else:
+                b.miss += 1
+        # nouvelles detections
+        for i, (rf, cf) in enumerate(dets):
+            if not used[i]:
+                self.balls.append(Ball(rf, cf))
+        # nettoyage
+        self.balls = [b for b in self.balls if b.miss <= 5]
+        return self.balls
+
+
+tracker = BallTracker()
+
+
+def predict_occupancy(balls, ice, horizon, player_speed):
+    """Simule chaque boule (ligne droite + rebond sur bord/glace/coin) et renvoie
+    occ[t] = cases MORTELLES au pas t (boule + ses 8 voisines : etre a 1 case =
+    perdu). t compte les pas du JOUEUR ; les boules avancent 'ratio' cases/pas."""
+    occ = [set() for _ in range(horizon + 1)]
+
+    def add_lethal(t, r, c):
         for ar in (-1, 0, 1):
             for ac in (-1, 0, 1):
-                if (ar, ac) != (0, 0):
-                    _bump(cost, r + ar, c + ac, COST_ADJACENT)
-    return cost
+                nr, nc = r + ar, c + ac
+                if in_grid(nr, nc):
+                    occ[t].add((nr, nc))
 
-
-def predicted_ball_cells(spheres, dirs):
-    """Cases ou une boule sera d'ici REACT_DIST cases, DANS SON SENS de marche
-    (projection directionnelle) -> si la boule s'eloigne, la case devant nous
-    n'est PAS marquee = "passable", on avance. Sinon on change de direction."""
-    reach = max(REACT_DIST, int(round(REACT_DIST * BALL_FASTER)))
-    cells = set()
-    for (r, c) in spheres:
-        cells.add((r, c))
-        dr, dc = dirs.get((r, c), (0, 0))
-        for step in range(1, reach + 1):
-            nr, nc = r + dr * step, c + dc * step
-            if in_grid(nr, nc):
-                cells.add((nr, nc))
-    return cells
-
-
-def _bump(cost, r, c, val):
-    if in_grid(r, c):
-        cost[(r, c)] = cost.get((r, c), 0.0) + val
+    for b in balls:
+        r, c = b.cell
+        d = b.dir
+        ratio = max(0.3, b.speed / max(0.1, player_speed)) if b.speed > 0 else 1.0
+        acc = 0.0
+        for t in range(horizon + 1):
+            add_lethal(t, r, c)
+            acc += ratio
+            hops = int(acc)
+            acc -= hops
+            for _ in range(hops):
+                if d == (0, 0):
+                    break
+                nr, nc = r + d[0], c + d[1]
+                if not in_grid(nr, nc) or (nr, nc) in ice:   # rebond
+                    d = (-d[0], -d[1])
+                    nr, nc = r + d[0], c + d[1]
+                    if not in_grid(nr, nc) or (nr, nc) in ice:
+                        break
+                r, c = nr, nc
+    return occ
 
 
 # ----------------------------------------------------------------------------
@@ -371,6 +440,47 @@ def astar(start, goal, ice, danger, risk=1.0):
     return None
 
 
+def spacetime_astar(start, goal, ice, occ, allow_lethal=False):
+    """A* dans l'espace-temps (case, t). occ[t] = cases mortelles au pas t.
+    L'attente sur place est autorisee (move (0,0)). Renvoie la suite de cases."""
+    H = len(occ) - 1
+    moves = DIRS8 + [(0, 0)]
+    start_s = (start, 0)
+    open_h = [(0.0, 0.0, start_s)]
+    came = {start_s: None}
+    g = {start_s: 0.0}
+    while open_h:
+        _, gc, (cell, t) = heapq.heappop(open_h)
+        if cell == goal:
+            path = []
+            s = (cell, t)
+            while s is not None:
+                path.append(s[0])
+                s = came[s]
+            return path[::-1]
+        if t >= H:
+            continue
+        for dr, dc in moves:
+            nr, nc = cell[0] + dr, cell[1] + dc
+            ncell, nt = (nr, nc), t + 1
+            if not in_grid(nr, nc) or ncell in ice:
+                continue
+            if dr != 0 and dc != 0:
+                if (cell[0] + dr, cell[1]) in ice or (cell[0], cell[1] + dc) in ice:
+                    continue
+            if not allow_lethal and ncell in occ[nt] and ncell != goal:
+                continue
+            step = 1.0 if (dr == 0 or dc == 0) else 1.41
+            ng = gc + step
+            st = (ncell, nt)
+            if st not in g or ng < g[st]:
+                g[st] = ng
+                came[st] = (cell, t)
+                h = math.hypot(goal[0] - nr, goal[1] - nc)
+                heapq.heappush(open_h, (ng + h, ng, st))
+    return None
+
+
 # ----------------------------------------------------------------------------
 # OVERLAY DE DEBUG (fenetre OpenCV)
 # ----------------------------------------------------------------------------
@@ -393,10 +503,14 @@ def draw_debug(img, ice, spheres, yellow, path, mode, remaining):
         x, y = cell_to_local(*yellow)
         cv2.rectangle(vis, (x - 14, y - 14), (x + 14, y + 14), (0, 255, 255), 2)
 
-    # spheres
-    for (r, c) in spheres:
-        x, y = cell_to_local(r, c)
+    # spheres + direction/vitesse mesurees (tracker)
+    for b in tracker.balls:
+        x, y = cell_to_local(*b.cell)
         cv2.circle(vis, (x, y), 12, (0, 0, 255), 2)
+        dr, dc = b.dir
+        if (dr, dc) != (0, 0):
+            tx, ty = cell_to_local(b.cell[0] + dr, b.cell[1] + dc)
+            cv2.arrowedLine(vis, (x, y), (tx, ty), (0, 0, 255), 2, tipLength=0.4)
 
     # chemin choisi
     if path and len(path) >= 2:
@@ -437,10 +551,12 @@ def bot_loop():
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
         ice = detect_ice(hsv)
-        spheres = detect_blobs(hsv, GREEN_LOW, GREEN_HIGH)
+        ice_set = set(ice)
+        ball_pts = detect_blob_pixels(hsv, GREEN_LOW, GREEN_HIGH)
+        dets = [local_to_gridf(x, y) for (x, y) in ball_pts]
+        balls = tracker.update(dets, dt)          # tracker : dir + vitesse
+        spheres = [b.cell for b in balls]
         yellow = detect_yellow(hsv)
-        dirs = estimate_sphere_dirs(spheres)
-        S.prev_spheres = spheres
 
         if yellow is None:
             time.sleep(LOOP_DELAY)
@@ -457,26 +573,24 @@ def bot_loop():
             S.deadline = time.time() + TIME_LIMIT
         S.last_yellow = yellow
 
-        # temps restant -> niveau de risque accepte
+        # temps restant -> mode (autorise a forcer si le chrono l'exige)
         remaining = (S.deadline - time.time()) if S.deadline else TIME_LIMIT
         elapsed = TIME_LIMIT - remaining
         if elapsed >= PANIC_AFTER:
-            risk = 0.12          # PANIQUE : fonce, quasi-ignore les spheres
             mode = "PANIC"
         elif elapsed >= URGENT_AFTER:
-            risk = 0.5           # URGENT : accepte de frôler
             mode = "URGENT"
         else:
-            risk = 1.0           # NORMAL : evitement maximal
             mode = "SAFE"
 
-        ice_set = set(ice)
-        danger = build_cost_map(spheres, dirs)
-        danger.pop(S.player, None)          # ne jamais penaliser la case de depart
-        soon = predicted_ball_cells(spheres, dirs)   # cases boules imminentes
+        # PREDICTION espace-temps : ou sera chaque boule (+ ses voisines) a chaque
+        # pas -> chemin garanti sans collision, re-calcule a chaque image.
+        occ = predict_occupancy(balls, ice_set, HORIZON, MOVE_SPEED)
+        soon = occ[1]                              # cases mortelles imminentes
 
-        path = astar(S.player, yellow, ice_set, danger, risk=risk)
-        if not path:  # secours : ignore le danger, garde juste la glace
+        path = spacetime_astar(S.player, yellow, ice_set, occ,
+                               allow_lethal=(mode == "PANIC"))
+        if not path:   # aucun chemin sur -> on force (dernier recours) via A* simple
             path = astar(S.player, yellow, ice_set, {}, risk=0.0)
 
         draw_debug(img, ice_set, spheres, yellow, path, mode, remaining)
@@ -486,12 +600,15 @@ def bot_loop():
 
         if path and len(path) >= 2:
             if path[1] in soon and mode != "PANIC":
-                # une boule fonce vers notre prochaine case -> on CHANGE de
-                # direction immediatement (esquive laterale sure).
+                # une boule va bloquer/toucher -> on CHANGE de direction tout de
+                # suite (esquive laterale sure a >= 1 case de toute boule).
                 ev = safe_step(S.player, yellow, ice_set, soon)
                 if ev:
                     target = step_cell = ev
-                # sinon : aucune case sure -> on attend une image (target=None)
+                else:
+                    # piege (aucune case sure) : bouger vers le but reste moins
+                    # pire que rester fige (mort certaine sinon).
+                    target = step_cell = path[1]
             else:
                 target = commit_target(path, soon)   # clic loin en ligne droite
                 step_cell = path[1]
@@ -540,6 +657,7 @@ def on_press(key):
             S.deadline = None
             S.move_accum = 0.0
             S.last_t = None
+            tracker.reset()
             print("[BOT] Demarrage ! (space=pause, q=quitter, p=re-detecter)")
         else:
             print("[BOT] Echec detection. Verifie que le plateau est bien visible puis reappuie 'p'.")
