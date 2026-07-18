@@ -30,17 +30,19 @@ from pynput import keyboard, mouse
 # CONFIGURATION (a ajuster si la detection est mauvaise)
 # ----------------------------------------------------------------------------
 GRID = 7                     # plateau 7x7
-CLICK_DELAY = 0.13           # temps estime pour traverser 1 case (ajuste si besoin)
-LOOP_DELAY = 0.015           # pause entre deux analyses d'image (reactivite max)
+CLICK_DELAY = 0.035          # spam de clics : delai mini entre 2 clics
+LOOP_DELAY = 0.008           # pause entre deux analyses d'image (reactivite max)
 CLICK_LATENCY = 0.10         # ping du jeu (~100 ms) : compense la prediction des boules
 PATCH = 6                    # demi-taille du carre echantillonne au centre d'une case
 SPHERE_MIN_AREA = 120        # aire mini d'un blob pour etre une sphere
 MARGIN = 60                  # marge (px) autour du plateau pour la capture
 SHOW_DEBUG = True            # fenetre OpenCV : grille, spheres, dalle, chemin
 
-# Les boules vont un peu plus vite que le joueur -> on projette leur position
-# plusieurs cases en avant (en tenant compte du ping) pour ne jamais les croiser.
-PREDICT_STEPS = 3            # nb de cases anticipees devant chaque boule
+# Reaction : si une boule fonce vers une case a <= REACT_DIST cases, on change
+# de direction. Si la boule s'eloigne (trajectoire opposee), c'est "passable"
+# -> on avance quand meme (gere automatiquement car la projection est directionnelle).
+REACT_DIST = 2               # distance de reaction (en cases)
+PREDICT_STEPS = 3            # nb de cases anticipees devant chaque boule (cout doux)
 BALL_FASTER = 1.4            # les boules ~40% plus rapides que le joueur
 
 # Chrono du jeu : il faut toucher la dalle dans les 10 s.
@@ -266,9 +268,10 @@ def build_cost_map(spheres, dirs):
 
 
 def predicted_ball_cells(spheres, dirs):
-    """Cases que les boules occuperont tres bientot (a eviter absolument pour
-    le prochain pas), en tenant compte du ping et de leur vitesse superieure."""
-    reach = max(1, int(round(PREDICT_STEPS * BALL_FASTER)))
+    """Cases ou une boule sera d'ici REACT_DIST cases, DANS SON SENS de marche
+    (projection directionnelle) -> si la boule s'eloigne, la case devant nous
+    n'est PAS marquee = "passable", on avance. Sinon on change de direction."""
+    reach = max(REACT_DIST, int(round(REACT_DIST * BALL_FASTER)))
     cells = set()
     for (r, c) in spheres:
         cells.add((r, c))
@@ -472,8 +475,6 @@ def bot_loop():
             time.sleep(CLICK_DELAY)
         else:
             time.sleep(LOOP_DELAY)
-
-        time.sleep(LOOP_DELAY)
 
 
 # ----------------------------------------------------------------------------
