@@ -57,6 +57,8 @@ MARGIN_SOFT = 2             # rayon d'anticipation (2 cases d'avance)
 SOFT_COST = 3.5             # cout d'une case dans la zone d'anticipation (doux)
 SANDWICH_COST = 12.0        # cout supplementaire d'une case prise en tenaille
 TURN_COST = 0.8             # penalite de changement de direction -> preferer tout droit
+REVERSE_COST = 6.0          # penalite d'un DEMI-TOUR (anti aller-retour / feinte inutile)
+EXTRACT_TH = 3              # si ma case devient mortelle dans <= X pas -> s'extirper
 
 # Temporisation : pas besoin de se presser. On attend dans une case sure proche
 # de la dalle, et on ne fonce la toucher qu'au dernier moment (marge de securite).
@@ -489,8 +491,9 @@ class Ball:
 
 class BallTracker:
     MATCH_DIST = 1.6     # distance max (cases) pour associer une detection a un track
-    EMA = 0.5            # lissage de la vitesse
+    EMA = 0.6            # lissage de la vitesse (assez reactif pour bien l'estimer)
     MIN_SPEED = 0.4      # en dessous, on garde l'ancienne direction
+    MAX_SPEED = 6.0      # borne (evite les valeurs aberrantes dues au bruit de detection)
 
     def __init__(self):
         self.balls = []
@@ -518,6 +521,7 @@ class BallTracker:
                     b.vc = self.EMA * vc + (1 - self.EMA) * b.vc
                 b.rf, b.cf = rf, cf
                 b.speed = max(abs(b.vr), abs(b.vc))
+                b.speed = min(b.speed, self.MAX_SPEED)   # borne anti-bruit
                 if b.speed >= self.MIN_SPEED:      # boule H/V -> axe dominant
                     if abs(b.vc) >= abs(b.vr):
                         b.dir = (0, int(np.sign(b.vc)))
@@ -675,10 +679,10 @@ def safe_until(cell, hard):
     return len(hard)
 
 
-def best_hold_cell(player, goal, ice, hard, soft, sandwich):
+def best_hold_cell(player, goal, ice, hard, soft, sandwich, balls):
     """Case ou TEMPORISER : la plus sûre possible (reste hors danger longtemps),
-    proche de la dalle, sans osciller pour rien. Permet d'attendre une ouverture
-    au lieu de foncer. Renvoie la case a viser (peut etre la case actuelle)."""
+    au large des boules et proche de la dalle, SANS bouger pour rien (forte inertie
+    -> evite les feintes/aller-retours inutiles). Peut renvoyer la case actuelle."""
     cands = [player]
     for dr, dc in moves_dirs():
         nr, nc = player[0] + dr, player[1] + dc
@@ -695,13 +699,14 @@ def best_hold_cell(player, goal, ice, hard, soft, sandwich):
         if cell == goal and cell != player:         # on TEMPORISE a cote, pas dessus
             continue
         score = 10.0 * safe_until(cell, hard)        # priorite : rester sûr longtemps
-        score -= 1.4 * math.hypot(goal[0] - cell[0], goal[1] - cell[1])  # rester pres de la dalle
+        score += 1.5 * _openness(cell, balls)        # rester au large des boules
+        score -= 1.2 * math.hypot(goal[0] - cell[0], goal[1] - cell[1])  # rester pres de la dalle
         if cell in soft[1]:
             score -= 4.0
         if cell in sandwich:
             score -= 12.0
         if cell == player:
-            score += 1.5                             # inertie : ne pas bouger pour rien
+            score += 4.0                             # forte inertie : ne pas feinter pour rien
         if score > bscore:
             bscore, best = score, cell
     return best
@@ -751,11 +756,19 @@ def commit_target(path, soon):
     return tgt
 
 
-def safe_step(start, goal, ice, soon):
-    """Choisit une case voisine sure (hors glace et hors trajectoire imminente
-    des boules) qui rapproche le plus du but. Sert a esquiver dans l'urgence."""
-    best = None
-    best_h = 1e9
+def _openness(cell, balls):
+    """Ouverture d'une case = distance (Manhattan) a la boule la plus proche.
+    Plus c'est grand, plus la case est 'au large' (espace safe)."""
+    if not balls:
+        return 6
+    return min(abs(cell[0] - b.cell[0]) + abs(cell[1] - b.cell[1]) for b in balls)
+
+
+def safe_step(start, goal, ice, soon, balls, prev_dir=(0, 0)):
+    """Un pas voisin SUR pour S'EXTIRPER vers l'espace libre : on maximise la
+    distance aux boules, on evite les bords (moins d'issues) et surtout on NE
+    REVIENT PAS sur ses pas (anti aller-retour / feinte inutile)."""
+    best, best_score = None, -1e9
     for dr, dc in moves_dirs():
         nr, nc = start[0] + dr, start[1] + dc
         if not in_grid(nr, nc) or (nr, nc) in ice or (nr, nc) in soon:
@@ -763,11 +776,35 @@ def safe_step(start, goal, ice, soon):
         if dr != 0 and dc != 0:
             if (start[0] + dr, start[1]) in ice or (start[0], start[1] + dc) in ice:
                 continue
-        h = math.hypot(goal[0] - nr, goal[1] - nc)
-        if h < best_h:
-            best_h = h
-            best = (nr, nc)
+        score = 2.2 * _openness((nr, nc), balls)
+        score -= math.hypot(goal[0] - nr, goal[1] - nc)      # garder un cap vers la dalle
+        if nr in (0, GRID - 1) or nc in (0, GRID - 1):
+            score -= 2.0                                      # eviter de se coincer au bord
+        if prev_dir != (0, 0) and (dr, dc) == (-prev_dir[0], -prev_dir[1]):
+            score -= 6.0                                      # NE PAS revenir sur ses pas
+        if score > best_score:
+            best_score, best = score, (nr, nc)
     return best
+
+
+def escape_target(start, goal, ice, soon, balls, prev_dir):
+    """Case d'extraction (espace libre) + la MEME direction prolongee de quelques
+    cases : cliquer loin => le perso file en ligne droite, GAGNE DE L'ESPACE, sans
+    osciller. Renvoie (cible_a_cliquer, premier_pas)."""
+    step = safe_step(start, goal, ice, soon, balls, prev_dir)
+    if step is None:
+        return None, None
+    d = (step[0] - start[0], step[1] - start[1])
+    tgt = cur = step
+    for _ in range(2):                                        # jusqu'a 2 cases de plus
+        nxt = (cur[0] + d[0], cur[1] + d[1])
+        if not in_grid(*nxt) or nxt in ice or nxt in soon:
+            break
+        if d[0] != 0 and d[1] != 0:
+            if (cur[0] + d[0], cur[1]) in ice or (cur[0], cur[1] + d[1]) in ice:
+                break
+        cur = tgt = nxt
+    return tgt, step
 
 
 def astar(start, goal, ice, danger, risk=1.0):
@@ -853,8 +890,11 @@ def spacetime_astar(start, goal, ice, hard, soft, sandwich, allow_lethal=False,
                 ld = S.cell_deaths.get(ncell, 0.0)
                 if ld:                              # apprentissage : case deja mortelle
                     pen += min(LEARN_MAX, LEARN_COST * ld)
-            if (dr, dc) != (0, 0) and pd != (0, 0) and (dr, dc) != pd:
-                pen += TURN_COST                  # changement de direction
+            if (dr, dc) != (0, 0) and pd != (0, 0):
+                if (dr, dc) == (-pd[0], -pd[1]):
+                    pen += REVERSE_COST           # demi-tour : fortement penalise
+                elif (dr, dc) != pd:
+                    pen += TURN_COST              # simple changement de direction
             ng = gc + step + pen
             st = (ncell, nt, (dr, dc))
             if st not in g or ng < g[st]:
@@ -1088,6 +1128,7 @@ def bot_loop():
             S.deadline = time.time() + TIME_LIMIT   # chrono relance a 10 s
             S.reached = True
             S.move_accum = 0.0
+            S.commit = None            # re-planifie proprement vers la PROCHAINE dalle
             print(f"[BOT] Dalle atteinte ! Score = {S.score} (best {S.best_score})")
 
         # temps restant -> mode (autorise a forcer si le chrono l'exige)
@@ -1147,11 +1188,17 @@ def bot_loop():
                 if _safe_neighbor(S.player, cand, ice_set, soon) and cand not in soft[1]:
                     imit_cell = cand
 
-        # FONCER vers la dalle seulement si : le temps presse, panique, ou rester
-        # ici devient dangereux. Sinon on TEMPORISE (on attend une ouverture).
-        must_go = (remaining <= travel + HOLD_BUFFER) or mode == "PANIC" or my_safe <= 2
+        # DECISION - 3 priorites claires :
+        #   1) FONCER si le temps presse ou PANIC (il FAUT toucher la dalle),
+        #   2) sinon S'EXTIRPER vers l'espace libre si on est en danger (direction
+        #      simple et ENGAGEE, sans revenir sur ses pas / sans feinter),
+        #   3) sinon TEMPORISER (rester au large, bouger le moins possible).
+        time_critical = remaining <= travel + HOLD_BUFFER
+        must_go = time_critical or mode == "PANIC"
         if not TEMPORIZE:
             must_go = True                         # temporisation desactivee -> foncer
+        blocked = bool(path and len(path) >= 2 and path[1] in soon)
+        danger_now = (my_safe <= EXTRACT_TH) or blocked
 
         if imit_cell is not None:
             # rejoue TON style (un pas dans la direction apprise)
@@ -1159,13 +1206,13 @@ def bot_loop():
             S.commit = None
             act = "IMIT"
         elif must_go and path and len(path) >= 2:
-            if path[1] in soon and mode != "PANIC":
-                # une boule va bloquer/toucher -> CHANGE de direction tout de suite.
-                ev = safe_step(S.player, yellow, ice_set, soon)
-                target = step_cell = ev if ev else path[1]
-                S.commit = None
+            if blocked and mode != "PANIC":
+                # une boule bloque le chemin direct -> s'extirper (sans demi-tour).
+                tgt, step = escape_target(S.player, yellow, ice_set, soon, balls, S.commit_dir)
+                target, step_cell = (tgt, step) if tgt else (path[1], path[1])
+                S.commit = tgt
             elif (S.commit is not None and S.commit != S.player
-                  and S.commit in path and path[1] not in soon):
+                  and S.commit in path and not blocked):
                 # ENGAGEMENT : on garde le cap deja pris (anti aller-retour inutile).
                 target = S.commit
                 step_cell = path[1]
@@ -1174,9 +1221,20 @@ def bot_loop():
                 step_cell = path[1]
                 S.commit = target
             act = "GO"
+        elif danger_now and mode != "PANIC":
+            # S'EXTIRPER vers l'espace libre : direction simple, engagee, on gagne
+            # de l'espace au lieu de feinter/reculer. Puis on pourra temporiser.
+            tgt, step = escape_target(S.player, yellow, ice_set, soon, balls, S.commit_dir)
+            if tgt:
+                target, step_cell = tgt, step
+                S.commit = tgt
+                act = "ESQ"
+            elif path and len(path) >= 2:
+                target = step_cell = path[1]
+                act = "GO"
         else:
-            # TEMPORISER : attendre dans la case la plus sûre proche de la dalle.
-            hold = best_hold_cell(S.player, yellow, ice_set, hard, soft, sandwich)
+            # TEMPORISER : attendre au large, en bougeant le moins possible.
+            hold = best_hold_cell(S.player, yellow, ice_set, hard, soft, sandwich, balls)
             S.commit = None
             act = "HOLD"
             if hold != S.player:

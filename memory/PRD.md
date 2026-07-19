@@ -60,6 +60,18 @@ apprentissage anti-mort heuristique (pas de réseau de neurones).
     A*) et retour à l'algo en URGENT/PANIC pour garantir l'objectif,
   - curseur « Imitation : tolerance » (IMIT_MAXDIST), compteur « Coups appris » dans le
     panneau IA. Imitation-par-mémoire (choix utilisateur), ZÉRO nouvelle dépendance.
+- **Comportement anti-oscillation / extraction (2026-06)** — réglages du feedback utilisateur :
+  - `REVERSE_COST` : pénalité forte du demi-tour dans A* → supprime les aller-retours /
+    feintes inutiles ("revenir sur ses pas").
+  - `EXTRACT_TH` + `escape_target()` : quand une case devient dangereuse (≤ X pas) sans
+    urgence de chrono, le bot **s'extirpe vers l'espace libre** dans une direction simple
+    et engagée (prolongée de 2 cases) au lieu de feinter — priorité claire GO / EXTRACT / HOLD.
+  - `best_hold_cell` : forte inertie + score d'ouverture → temporise au large, bouge moins.
+  - Après avoir touché une dalle : `S.commit` remis à zéro → re-planifie proprement vers la
+    prochaine dalle (plus de "panique"/backtrack au moment de l'enchaînement).
+  - Tracker de boules plus réactif (EMA 0.6) + borne anti-bruit sur la vitesse mesurée.
+  - Nouveaux curseurs exposés dans l'interface : « Anti demi-tour » et « S'extirper si
+    danger à ≤ X pas ».
 
 ## Historique décisions
 - Face-tracking / gating de tour : implémenté puis jugé peu fiable par l'utilisateur.

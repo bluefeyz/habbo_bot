@@ -31,18 +31,22 @@ PRESETS = {
     "Prudent": dict(CLICK_DELAY=0.05, MOVE_SPEED=2.6, HORIZON=18, MARGIN_HARD=2,
                     MARGIN_SOFT=3, SOFT_COST=6.0, SANDWICH_COST=16.0,
                     HOLD_BUFFER=2.2, UNC_GROW=2, LOOP_DELAY=0.008,
+                    REVERSE_COST=8.0, EXTRACT_TH=4,
                     TEMPORIZE=True, DODGE=True, DIAGONALS=True),
     "Equilibre": dict(CLICK_DELAY=0.03, MOVE_SPEED=2.9, HORIZON=16, MARGIN_HARD=1,
                       MARGIN_SOFT=2, SOFT_COST=3.5, SANDWICH_COST=12.0,
                       HOLD_BUFFER=1.6, UNC_GROW=3, LOOP_DELAY=0.006,
+                      REVERSE_COST=6.0, EXTRACT_TH=3,
                       TEMPORIZE=True, DODGE=True, DIAGONALS=True),
     "Agressif": dict(CLICK_DELAY=0.02, MOVE_SPEED=3.2, HORIZON=14, MARGIN_HARD=1,
                      MARGIN_SOFT=2, SOFT_COST=2.5, SANDWICH_COST=9.0,
                      HOLD_BUFFER=1.1, UNC_GROW=4, LOOP_DELAY=0.004,
+                     REVERSE_COST=5.0, EXTRACT_TH=3,
                      TEMPORIZE=True, DODGE=True, DIAGONALS=True),
     "EXTREME": dict(CLICK_DELAY=0.012, MOVE_SPEED=3.6, HORIZON=14, MARGIN_HARD=1,
                     MARGIN_SOFT=2, SOFT_COST=2.0, SANDWICH_COST=8.0,
                     HOLD_BUFFER=0.8, UNC_GROW=5, LOOP_DELAY=0.002,
+                    REVERSE_COST=4.0, EXTRACT_TH=2,
                     TEMPORIZE=True, DODGE=True, DIAGONALS=True),
 }
 
@@ -57,6 +61,8 @@ SLIDERS = [
     ("SOFT_COST", "Cout anticipation (evitement)", 0.0, 15.0, 0.5),
     ("SANDWICH_COST", "Cout anti-sandwich", 0.0, 30.0, 1.0),
     ("TURN_COST", "Penalite de virage (tout droit)", 0.0, 3.0, 0.1),
+    ("REVERSE_COST", "Anti demi-tour (grand = moins d'aller-retour)", 0.0, 15.0, 0.5),
+    ("EXTRACT_TH", "S'extirper si danger a <= X pas", 1, 5, 1),
     ("HOLD_BUFFER", "Marge avant de foncer (s)", 0.3, 3.0, 0.1),
     ("UNC_GROW", "Incertitude boules (petit = prudent)", 1, 8, 1),
     ("URGENT_AFTER", "Passage URGENT a (s ecoulees)", 3.0, 9.0, 0.5),
@@ -236,7 +242,7 @@ class App:
 
     def apply_slider(self, attr):
         val = self.vars[attr].get()
-        if attr in ("HORIZON", "MARGIN_HARD", "MARGIN_SOFT", "UNC_GROW"):
+        if attr in ("HORIZON", "MARGIN_HARD", "MARGIN_SOFT", "UNC_GROW", "EXTRACT_TH"):
             val = int(round(val))
         setattr(bot, attr, val)
 
